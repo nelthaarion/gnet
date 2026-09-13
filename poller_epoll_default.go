@@ -15,7 +15,7 @@
 
 //go:build linux && !poll_opt
 
-package netpoll
+package gnet
 
 import (
 	"errors"
