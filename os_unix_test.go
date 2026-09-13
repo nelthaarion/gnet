@@ -20,9 +20,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/sys/unix"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
-	goPool "github.com/panjf2000/gnet/v2/pkg/pool/goroutine"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
+	goPool "github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 var SysClose = unix.Close

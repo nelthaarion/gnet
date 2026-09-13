@@ -20,7 +20,7 @@ import (
 	"errors"
 	"runtime"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 )
 
 func (el *eventloop) rotate() error {

@@ -21,10 +21,10 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/netpoll"
-	"github.com/panjf2000/gnet/v2/pkg/queue"
-	"github.com/panjf2000/gnet/v2/pkg/socket"
+	"github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/netpoll"
+	"github.com/nelthaarion/gnet/v2/pkg/queue"
+	"github.com/nelthaarion/gnet/v2/pkg/socket"
 )
 
 func (el *eventloop) accept0(fd int, _ netpoll.IOEvent, _ netpoll.IOFlags) error {

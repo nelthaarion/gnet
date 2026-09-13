@@ -25,10 +25,10 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
-	"github.com/panjf2000/gnet/v2/pkg/netpoll"
-	"github.com/panjf2000/gnet/v2/pkg/socket"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
+	"github.com/nelthaarion/gnet/v2/pkg/netpoll"
+	"github.com/nelthaarion/gnet/v2/pkg/socket"
 )
 
 type listener struct {

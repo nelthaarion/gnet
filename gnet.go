@@ -29,11 +29,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/panjf2000/gnet/v2/internal/gfd"
-	"github.com/panjf2000/gnet/v2/pkg/buffer/ring"
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
-	"github.com/panjf2000/gnet/v2/pkg/math"
+	"github.com/nelthaarion/gnet/v2/internal/gfd"
+	"github.com/nelthaarion/gnet/v2/pkg/buffer/ring"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
+	"github.com/nelthaarion/gnet/v2/pkg/math"
 )
 
 // Action is an action that occurs after the completion of an event.

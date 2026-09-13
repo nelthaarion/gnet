@@ -15,7 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	goPool "github.com/panjf2000/gnet/v2/pkg/pool/goroutine"
+	goPool "github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 func (lb *roundRobinLoadBalancer) register(el *eventloop) {

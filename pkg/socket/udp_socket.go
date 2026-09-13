@@ -24,7 +24,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 )
 
 // GetUDPSockAddr the structured addresses based on the protocol and raw address.

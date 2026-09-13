@@ -19,8 +19,8 @@ import (
 	"net"
 	"runtime"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/pool/goroutine"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 func (eng *engine) listenStream(ln net.Listener) (err error) {

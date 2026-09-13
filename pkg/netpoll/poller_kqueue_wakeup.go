@@ -19,7 +19,7 @@ package netpoll
 import (
 	"golang.org/x/sys/unix"
 
-	"github.com/panjf2000/gnet/v2/pkg/logging"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
 )
 
 func (p *Poller) addWakeupEvent() error {

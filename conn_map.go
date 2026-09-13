@@ -19,7 +19,7 @@ package gnet
 import (
 	"sync/atomic"
 
-	"github.com/panjf2000/gnet/v2/internal/gfd"
+	"github.com/nelthaarion/gnet/v2/internal/gfd"
 )
 
 type connMatrix struct {

@@ -24,8 +24,8 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
 )
 
 type listener struct {

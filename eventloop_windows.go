@@ -23,9 +23,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
-	"github.com/panjf2000/gnet/v2/pkg/pool/goroutine"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	"github.com/nelthaarion/gnet/v2/pkg/logging"
+	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 type eventloop struct {

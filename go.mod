@@ -1,5 +1,4 @@
-module github.com/panjf2000/gnet/v2
-
+module github.com/nelthaarion/gnet/v2
 require (
 	github.com/panjf2000/ants/v2 v2.12.1
 	github.com/stretchr/testify v1.11.1

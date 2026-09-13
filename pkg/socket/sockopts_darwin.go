@@ -20,7 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
+	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 )
 
 // SetKeepAlivePeriod enables the SO_KEEPALIVE option on the socket and sets
