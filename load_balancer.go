@@ -17,6 +17,7 @@ package gnet
 import (
 	"hash/crc32"
 	"net"
+	"sync/atomic"
 
 	"github.com/nelthaarion/gnet/v2/pkg/bs"
 )
@@ -53,9 +54,14 @@ type (
 	}
 
 	// roundRobinLoadBalancer with Round-Robin algorithm.
+	//
+	// FIX P-1: nextIndex was read and written without synchronisation, causing a
+	// data race when Engine.Register() calls next() concurrently with the acceptor
+	// goroutine on a multicore engine. Changed to atomic.Uint64 so every increment
+	// and load is a single indivisible operation without a mutex.
 	roundRobinLoadBalancer struct {
 		baseLoadBalancer
-		nextIndex uint64
+		nextIndex atomic.Uint64
 	}
 
 	// leastConnectionsLoadBalancer with Least-Connections algorithm.
@@ -103,10 +109,14 @@ func (lb *baseLoadBalancer) len() int {
 // ==================================== Implementation of Round-Robin load-balancer ====================================
 
 // next returns the eligible event-loop based on Round-Robin algorithm.
-func (lb *roundRobinLoadBalancer) next(_ net.Addr) (el *eventloop) {
-	el = lb.eventLoops[lb.nextIndex%uint64(lb.size)]
-	lb.nextIndex++
-	return
+//
+// FIX P-1: Use atomic.Uint64.Add so concurrent callers from the acceptor goroutine
+// and Engine.Register() goroutines never race on nextIndex. The previous plain
+// lb.nextIndex++ was an unsynchronised read-modify-write on a shared integer.
+func (lb *roundRobinLoadBalancer) next(_ net.Addr) *eventloop {
+	// Add(1) returns the new value; subtract 1 to get the pre-increment index.
+	idx := lb.nextIndex.Add(1) - 1
+	return lb.eventLoops[idx%uint64(lb.size)]
 }
 
 // ================================= Implementation of Least-Connections load-balancer =================================

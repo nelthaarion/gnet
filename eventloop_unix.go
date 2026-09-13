@@ -110,6 +110,14 @@ type connWithCallback struct {
 	cb func()
 }
 
+// enroll dials or wraps an existing net.Conn and registers it with this event-loop.
+//
+// FIX S-6: The previous code submitted the dial+register work to goroutine.DefaultWorkerPool
+// (which is non-blocking). If the pool was full it returned an error but resCh was never
+// closed or written to, so Engine.Register() callers would block forever waiting on the channel.
+//
+// Fix: on Submit failure, immediately send the error on resCh and close it so callers
+// always receive exactly one value and the channel is GC-able.
 func (el *eventloop) enroll(c net.Conn, addr net.Addr, ctx any) (resCh chan RegisteredResult, err error) {
 	resCh = make(chan RegisteredResult, 1)
 	err = goroutine.DefaultWorkerPool.Submit(func() {
@@ -199,6 +207,15 @@ func (el *eventloop) enroll(c net.Conn, addr net.Addr, ctx any) (resCh chan Regi
 
 		resCh <- RegisteredResult{Conn: gc}
 	})
+
+	// FIX S-6: If the goroutine pool is full (non-blocking mode returns error),
+	// enroll() previously returned a non-nil err with an open, empty resCh.
+	// Any caller doing <-resCh would deadlock. Send the error and close the
+	// channel so callers always get exactly one result.
+	if err != nil {
+		resCh <- RegisteredResult{Err: fmt.Errorf("goroutine pool is full, failed to enroll connection: %w", err)}
+		close(resCh)
+	}
 	return
 }
 
@@ -369,13 +386,17 @@ func (el *eventloop) close(c *conn, err error) error {
 	action := el.eventHandler.OnClose(c, err)
 
 	// Send residual data in buffer back to the remote before actually closing the connection.
+	// FIX P-6: The previous code silently discarded write errors here (only `break` on error,
+	// no logging). Log the error so operators know when data was lost during teardown.
 	for !c.outboundBuffer.IsEmpty() {
 		iov, _ := c.outboundBuffer.Peek(0)
 		if len(iov) > iovMax {
 			iov = iov[:iovMax]
 		}
-		n, err := gio.Writev(c.fd, iov)
-		if err != nil {
+		n, werr := gio.Writev(c.fd, iov)
+		if werr != nil {
+			el.getLogger().Warnf("failed to flush outbound buffer on close for fd=%d: %v",
+				c.fd, os.NewSyscallError("writev", werr))
 			break
 		}
 		_, _ = c.outboundBuffer.Discard(n)
@@ -427,7 +448,17 @@ func (el *eventloop) ticker(ctx context.Context) {
 	for {
 		delay, action = el.eventHandler.OnTick()
 		switch action {
-		case None, Close:
+		case None:
+			// no-op: continue ticking
+		case Close:
+			// FIX P-5: The original code lumped Close with None (case None, Close:)
+			// causing Close returned from OnTick to be silently ignored.
+			// Close has no meaningful target in a ticker (there is no current
+			// connection), so we log a warning to alert the developer that their
+			// OnTick implementation is returning an unexpected action, then
+			// continue as if None was returned.
+			el.getLogger().Warnf("OnTick() returned Action.Close which has no effect in a ticker; " +
+				"return Action.None to continue ticking or Action.Shutdown to stop the engine")
 		case Shutdown:
 			// It seems reasonable to mark this as low-priority, waiting for some tasks like asynchronous writes
 			// to finish up before shutting down the service.
@@ -486,33 +517,3 @@ func (el *eventloop) handleAction(c *conn, action Action) error {
 		return nil
 	}
 }
-
-/*
-func (el *eventloop) execCmd(a any) (err error) {
-	cmd := a.(*asyncCmd)
-	c := el.connections.getConnByGFD(cmd.fd)
-	if c == nil || c.gfd != cmd.fd {
-		return errorx.ErrInvalidConn
-	}
-
-	defer func() {
-		if cmd.cb != nil {
-			_ = cmd.cb(c, err)
-		}
-	}()
-
-	switch cmd.typ {
-	case asyncCmdClose:
-		return el.close(c, nil)
-	case asyncCmdWake:
-		return el.wake(c)
-	case asyncCmdWrite:
-		_, err = c.Write(cmd.param.([]byte))
-	case asyncCmdWritev:
-		_, err = c.Writev(cmd.param.([][]byte))
-	default:
-		return errorx.ErrUnsupportedOp
-	}
-	return
-}
-*/

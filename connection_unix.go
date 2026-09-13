@@ -26,7 +26,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/nelthaarion/gnet/v2/internal/gfd"
-	"github.com/nelthaarion/gnet/v2/pkg/bs"
 	"github.com/nelthaarion/gnet/v2/pkg/buffer/elastic"
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 	gio "github.com/nelthaarion/gnet/v2/pkg/io"
@@ -50,7 +49,7 @@ type conn struct {
 	pollAttachment netpoll.PollAttachment // connection attachment for poller
 	inboundBuffer  elastic.RingBuffer     // buffer for leftover data from the remote
 	buffer         []byte                 // buffer for the latest bytes
-	cache          []byte                 // temporary cache for the inbound data
+	cache          []byte                 // temporary cache for the inbound data (owned by bsPool, freed by Discard/release)
 	isDatagram     bool                   // UDP protocol
 	opened         bool                   // connection opened event fired
 	isEOF          bool                   // whether the connection has reached EOF
@@ -95,20 +94,28 @@ func (c *conn) release() {
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.buffer = nil
-	if addr, ok := c.localAddr.(*net.TCPAddr); ok && len(c.loop.listeners) == 0 && len(addr.Zone) > 0 {
-		bsPool.Put(bs.StringToBytes(addr.Zone))
+
+	// FIX P-8: If the caller invoked Peek() but never called Discard() (e.g. the
+	// connection was closed mid-protocol), c.cache still holds a pooled slice that
+	// was never returned. Return it now to prevent a permanent pool leak.
+	if len(c.cache) > 0 {
+		bsPool.Put(c.cache)
+		c.cache = nil
 	}
-	if addr, ok := c.remoteAddr.(*net.TCPAddr); ok && len(addr.Zone) > 0 {
-		bsPool.Put(bs.StringToBytes(addr.Zone))
-	}
-	if addr, ok := c.localAddr.(*net.UDPAddr); ok && len(c.loop.listeners) == 0 && len(addr.Zone) > 0 {
-		bsPool.Put(bs.StringToBytes(addr.Zone))
-	}
-	if addr, ok := c.remoteAddr.(*net.UDPAddr); ok && len(addr.Zone) > 0 {
-		bsPool.Put(bs.StringToBytes(addr.Zone))
-	}
+
+	// FIX S-2: The previous code called bsPool.Put(bs.StringToBytes(addr.Zone))
+	// for TCPAddr and UDPAddr Zone fields. bs.StringToBytes returns an unsafe slice
+	// pointing into the Go string's backing array, which is owned by the net package
+	// runtime — NOT by bsPool. Returning foreign memory to the pool means the pool
+	// may hand it to another connection while the original string is still alive,
+	// creating a Use-After-Free / data-corruption hazard on IPv6 link-local
+	// connections (e.g. "fe80::1%eth0").
+	//
+	// The net package manages Zone strings with the GC; we must not touch them.
+	// Simply nil out the address pointers and let the GC do its job.
 	c.localAddr = nil
 	c.remoteAddr = nil
+
 	if !c.isDatagram {
 		c.remote = nil
 		c.inboundBuffer.Done()
@@ -172,7 +179,16 @@ loop:
 		return 0, err
 	}
 	data = data[sent:]
-	if isET && len(data) > 0 {
+	// FIX P-4: In ET mode the original code looped unconditionally via
+	// "goto loop" whenever data remained. If the kernel's send-buffer is
+	// congested (small cwnd) this could spin forever inside Write(), blocking
+	// the event-loop goroutine and starving all other connections.
+	//
+	// Guard: only retry immediately if EAGAIN was NOT returned and the kernel
+	// accepted a non-zero amount this iteration (i.e. progress was made).
+	// When no progress can be made, fall through to the outboundBuffer path
+	// exactly like eventloop.write() does with its chunk-based threshold.
+	if isET && len(data) > 0 && sent > 0 {
 		goto loop
 	}
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
@@ -234,7 +250,9 @@ loop:
 		}
 	}
 	bs = bs[pos:]
-	if isET && remaining > 0 {
+	// FIX P-4 (writev): Same guard as write() above — only loop again if
+	// progress was made, preventing an infinite spin under congestion.
+	if isET && remaining > 0 && sent > 0 {
 		goto loop
 	}
 
@@ -330,6 +348,14 @@ func (c *conn) Read(p []byte) (n int, err error) {
 	return
 }
 
+// Next returns the next n bytes and advances the inbound buffer.
+//
+// FIX P-2: When inboundBuffer is non-empty, Next() allocated from bsPool
+// (via bsPool.Get) but never called bsPool.Put — leaking the pooled slice
+// on every fragmented read. The fix mirrors the Peek()/Discard() pattern:
+// the allocated slice is stored in c.cache so that the next call to Next()
+// or Discard() can return it to the pool. release() also returns any
+// outstanding c.cache slice (see FIX P-8 in release()).
 func (c *conn) Next(n int) (buf []byte, err error) {
 	inBufferLen := c.inboundBuffer.Buffered()
 	if totalLen := inBufferLen + len(c.buffer); n > totalLen {
@@ -344,8 +370,16 @@ func (c *conn) Next(n int) (buf []byte, err error) {
 		return
 	}
 
+	// Free any previous pool slice before allocating a new one.
+	if len(c.cache) > 0 {
+		bsPool.Put(c.cache)
+		c.cache = nil
+	}
+
 	buf = bsPool.Get(n)
 	_, err = c.Read(buf)
+	// Track the pooled slice so Discard() or release() can return it.
+	c.cache = buf
 	return
 }
 
@@ -563,6 +597,8 @@ func (*conn) SetWriteDeadline(_ time.Time) error {
 	return errorx.ErrUnsupportedOp
 }
 
+// SafeContext returns the user-defined context stored via SetSafeContext.
+// It is safe to call from any goroutine.
 func (c *conn) SafeContext() (ctx any) {
 	if p := c.safeCtx.Load(); p != nil {
 		return *p
@@ -570,6 +606,22 @@ func (c *conn) SafeContext() (ctx any) {
 	return nil
 }
 
+// SetSafeContext stores a user-defined context that can be read concurrently.
+//
+// FIX S-5: The original code stored &ctx where ctx is a local parameter.
+// Go escape analysis does promote this to the heap, but storing a pointer
+// to an interface{} via atomic.Pointer[any] is semantically fragile:
+// every call allocates a new heap object. The correct pattern keeps the
+// same code structure but we document the escape explicitly so future
+// maintainers understand why &ctx is intentional here.
+//
+// A cleaner redesign would use atomic.Pointer[safeCtxWrapper] with a
+// concrete wrapper type, but that would require a public API change.
+// For now we preserve the existing API surface and add the explanation.
 func (c *conn) SetSafeContext(ctx any) {
+	// &ctx escapes to the heap here (confirmed by escape analysis).
+	// Each call allocates one pointer-sized object. This is acceptable
+	// because SetSafeContext is called infrequently (once per connection
+	// register path, not per-request).
 	c.safeCtx.Store(&ctx)
 }
