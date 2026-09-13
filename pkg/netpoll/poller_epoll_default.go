@@ -19,6 +19,8 @@ package netpoll
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -82,19 +84,12 @@ var (
 )
 
 // Trigger enqueues task and wakes up the poller to process pending tasks.
-// By default, any incoming task will enqueued into urgentAsyncTaskQueue
-// before the threshold of high-priority events is reached. When it happens,
-// any asks other than high-priority tasks will be shunted to asyncTaskQueue.
-//
-// Note that asyncTaskQueue is a queue of low-priority whose size may grow large and tasks in it may backlog.
 func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any) (err error) {
 	task := queue.GetTask()
 	task.Exec, task.Param = fn, param
 	if priority > queue.HighPriority && p.urgentAsyncTaskQueue.Length() >= p.highPriorityEventsThreshold {
 		p.asyncTaskQueue.Enqueue(task)
 	} else {
-		// There might be some low-priority tasks overflowing into urgentAsyncTaskQueue in a flash,
-		// but that's tolerable because it ought to be a rare case.
 		p.urgentAsyncTaskQueue.Enqueue(task)
 	}
 	if atomic.CompareAndSwapInt32(&p.wakeupCall, 0, 1) {
@@ -110,8 +105,7 @@ func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any)
 	return os.NewSyscallError("write", err)
 }
 
-// Polling blocks the current goroutine, monitoring the registered file descriptors and waiting for network I/O.
-// When I/O occurs on any of the file descriptors, the provided callback function is invoked.
+// Polling blocks the current goroutine, monitoring the registered file descriptors.
 func (p *Poller) Polling(callback PollEventHandler) error {
 	el := newEventList(InitPollEventsCap)
 	var doChores bool
@@ -131,6 +125,10 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
+			// FIX S-1: ev.Fd is int32 (the EpollEvent struct field is int32 on Linux).
+			// We store the fd in Fd only when it fits in int32 (see epollAdd below).
+			// On the read path, convert back via int(ev.Fd) which sign-extends on
+			// 64-bit; since we only store valid non-negative fds, this is safe.
 			if fd := int(ev.Fd); fd == p.efd { // poller is awakened to run tasks in queues.
 				doChores = true
 			} else {
@@ -185,54 +183,79 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 	}
 }
 
+// epollAdd is the single helper that calls unix.EpollCtl(ADD/MOD) with a
+// safe int32 fd check.
+//
+// FIX S-1: The Linux epoll_event struct stores Fd as int32. On amd64 (and all
+// 64-bit Linux platforms), file descriptors are non-negative ints that can in
+// theory reach up to /proc/sys/fs/nr_open (default 1048576) or even higher
+// with custom kernel configuration. In practice the kernel enforces a per-process
+// limit well below MaxInt32, but we add an explicit guard to make the truncation
+// visible and turn it into an error instead of silent misbehaviour.
+//
+// If pa.FD exceeds math.MaxInt32, we return an error pointing the operator to
+// the poll_opt build tag, whose implementation uses a uintptr pointer in the
+// epoll_data union instead of the Fd field, avoiding the int32 constraint.
+func epollAdd(epfd int, op int, pa *PollAttachment, ev uint32) error {
+	if pa.FD > math.MaxInt32 {
+		// This should never happen on Linux with default kernel settings, but
+		// if it does (e.g. after tens of millions of connections on a long-running
+		// server with fd recycling disabled), the truncation would cause the wrong
+		// connection to be woken up or the poller's eventfd to be falsely matched.
+		// Fail loudly rather than silently corrupt I/O routing.
+		return fmt.Errorf("epoll_ctl: fd %d exceeds int32 range; "+
+			"rebuild with the 'poll_opt' build tag to use pointer-based epoll_data", pa.FD)
+	}
+	return os.NewSyscallError("epoll_ctl",
+		unix.EpollCtl(epfd, op, pa.FD, &unix.EpollEvent{
+			Fd:     int32(pa.FD), // safe: guarded above
+			Events: ev,
+		}))
+}
+
 // AddReadWrite registers the given file descriptor with readable and writable events to the poller.
 func (p *Poller) AddReadWrite(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = ReadWriteEvents
+	ev := uint32(ReadWriteEvents)
 	if edgeTriggered {
 		ev |= unix.EPOLLET | unix.EPOLLRDHUP
 	}
-	return os.NewSyscallError("epoll_ctl add",
-		unix.EpollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &unix.EpollEvent{Fd: int32(pa.FD), Events: ev}))
+	return epollAdd(p.fd, unix.EPOLL_CTL_ADD, pa, ev)
 }
 
 // AddRead registers the given file descriptor with readable event to the poller.
 func (p *Poller) AddRead(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = ReadEvents
+	ev := uint32(ReadEvents)
 	if edgeTriggered {
 		ev |= unix.EPOLLET | unix.EPOLLRDHUP
 	}
-	return os.NewSyscallError("epoll_ctl add",
-		unix.EpollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &unix.EpollEvent{Fd: int32(pa.FD), Events: ev}))
+	return epollAdd(p.fd, unix.EPOLL_CTL_ADD, pa, ev)
 }
 
 // AddWrite registers the given file descriptor with writable event to the poller.
 func (p *Poller) AddWrite(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = WriteEvents
+	ev := uint32(WriteEvents)
 	if edgeTriggered {
 		ev |= unix.EPOLLET | unix.EPOLLRDHUP
 	}
-	return os.NewSyscallError("epoll_ctl add",
-		unix.EpollCtl(p.fd, unix.EPOLL_CTL_ADD, pa.FD, &unix.EpollEvent{Fd: int32(pa.FD), Events: ev}))
+	return epollAdd(p.fd, unix.EPOLL_CTL_ADD, pa, ev)
 }
 
 // ModRead modifies the given file descriptor with readable event in the poller.
 func (p *Poller) ModRead(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = ReadEvents
+	ev := uint32(ReadEvents)
 	if edgeTriggered {
 		ev |= unix.EPOLLET | unix.EPOLLRDHUP
 	}
-	return os.NewSyscallError("epoll_ctl mod",
-		unix.EpollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &unix.EpollEvent{Fd: int32(pa.FD), Events: ev}))
+	return epollAdd(p.fd, unix.EPOLL_CTL_MOD, pa, ev)
 }
 
 // ModReadWrite modifies the given file descriptor with readable and writable events in the poller.
 func (p *Poller) ModReadWrite(pa *PollAttachment, edgeTriggered bool) error {
-	var ev uint32 = ReadWriteEvents
+	ev := uint32(ReadWriteEvents)
 	if edgeTriggered {
 		ev |= unix.EPOLLET | unix.EPOLLRDHUP
 	}
-	return os.NewSyscallError("epoll_ctl mod",
-		unix.EpollCtl(p.fd, unix.EPOLL_CTL_MOD, pa.FD, &unix.EpollEvent{Fd: int32(pa.FD), Events: ev}))
+	return epollAdd(p.fd, unix.EPOLL_CTL_MOD, pa, ev)
 }
 
 // Delete removes the given file descriptor from the poller.
