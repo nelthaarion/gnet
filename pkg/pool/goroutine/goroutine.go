@@ -18,7 +18,7 @@ package goroutine
 import (
 	"time"
 
-	"github.com/panjf2000/ants/v2"
+	"github.com/nelthaarion/ants/v2"
 
 	"github.com/nelthaarion/gnet/v2/pkg/logging"
 )
