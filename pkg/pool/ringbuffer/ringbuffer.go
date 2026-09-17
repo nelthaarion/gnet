@@ -87,7 +87,12 @@ func Put(b *RingBuffer) { builtinPool.Put(b) }
 //
 // The buffer mustn't be accessed after returning to the pool.
 func (p *Pool) Put(b *RingBuffer) {
-	idx := index(b.Len())
+	// FIX L-11: this recorded b.Len() but then decided whether to keep the buffer
+	// with b.Cap(), so the histogram being calibrated described a different
+	// population from the one the pool actually retains. What a retained buffer
+	// costs is its capacity, and what Get() hands back is a buffer sized from
+	// defaultSize, so capacity is the measurement that belongs in both places.
+	idx := index(b.Cap())
 
 	if atomic.AddUint64(&p.calls[idx], 1) > calibrateCallsThreshold {
 		p.calibrate()

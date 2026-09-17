@@ -84,18 +84,35 @@ func (eng *engine) runEventLoops(ctx context.Context, numEventLoop int) error {
 	lns := eng.listeners
 	// Create loops locally and bind the listeners.
 	for i := 0; i < numEventLoop; i++ {
+		var p *netpoll.Poller
+		// FIX L-3: the listeners and the poller created for the iteration that
+		// fails are not reachable from any registered event-loop, so nothing would
+		// ever close them (the listeners and pollers of the iterations before it
+		// are closed by the caller through closeEventLoops).
+		cleanup := func() {
+			if p != nil {
+				_ = p.Close()
+			}
+			if i > 0 {
+				for _, ln := range lns {
+					ln.close()
+				}
+			}
+		}
 		if i > 0 {
 			lns = make(map[int]*listener, len(eng.listeners))
 			for _, l := range eng.listeners {
 				ln, err := initListener(l.network, l.address, eng.opts)
 				if err != nil {
+					cleanup()
 					return err
 				}
 				lns[ln.fd] = ln
 			}
 		}
-		p, err := netpoll.OpenPoller()
-		if err != nil {
+		var err error
+		if p, err = netpoll.OpenPoller(); err != nil {
+			cleanup()
 			return err
 		}
 		el := new(eventloop)
@@ -107,6 +124,7 @@ func (eng *engine) runEventLoops(ctx context.Context, numEventLoop int) error {
 		el.eventHandler = eng.eventHandler
 		for _, ln := range lns {
 			if err = el.poller.AddRead(ln.packPollAttachment(el.accept), false); err != nil {
+				cleanup()
 				return err
 			}
 		}
@@ -168,6 +186,10 @@ func (eng *engine) activateReactors(ctx context.Context, numEventLoop int) error
 	el.eventHandler = eng.eventHandler
 	for _, ln := range eng.listeners {
 		if err = el.poller.AddRead(ln.packPollAttachment(el.accept0), true); err != nil {
+			// FIX L-3: the ingress event-loop is only assigned to eng.ingress once
+			// every listener is registered, so closeEventLoops cannot reach this
+			// poller yet.
+			_ = p.Close()
 			return err
 		}
 	}
@@ -272,7 +294,19 @@ func run(eventHandler EventHandler, listeners []*listener, options *Options, add
 	defer eng.stop(rootCtx, e)
 
 	for _, addr := range addrs {
-		allEngines.Store(addr, &eng)
+		// FIX S-4: this was an unconditional Store, so a second engine registered on
+		// the same address silently replaced the first in allEngines — the earlier
+		// engine keeps running but gnet.Stop, which looks engines up by address, can
+		// never reach it again: the event-loops, pollers and listeners of that engine
+		// leak for the life of the process.  LoadOrStore finds the clash without
+		// overwriting, which lets us say so; the newest engine still ends up in the
+		// map, so a later Stop stops what the caller last started.
+		if prev, loaded := allEngines.LoadOrStore(addr, &eng); loaded {
+			eng.opts.Logger.Warnf("gnet: an engine is already registered on %s (%p); "+
+				"it is replaced in the registry and can no longer be stopped with gnet.Stop, "+
+				"use Engine.Stop or a distinct address", addr, prev)
+			allEngines.Store(addr, &eng)
+		}
 	}
 
 	return nil
@@ -285,7 +319,19 @@ func setKeepAlive(fd int, enabled bool, idle, intvl time.Duration, cnt int) erro
 	if cnt == 0 {
 		cnt = 5
 	}
-	return socket.SetKeepAlive(fd, enabled, int(idle.Seconds()), int(intvl.Seconds()), cnt)
+	return socket.SetKeepAlive(fd, enabled, keepAliveSeconds(idle), keepAliveSeconds(intvl), cnt)
+}
+
+// keepAliveSeconds converts a keepalive duration to the whole seconds the socket
+// options take.  Rounding up matters: WithTCPKeepAlive(time.Second) derives an
+// interval of 200ms, which truncates to 0 and was rejected by SetKeepAlive with
+// "invalid time duration" — the engine then refused to start over a value the
+// kernel simply cannot express any more precisely than a second.
+func keepAliveSeconds(d time.Duration) int {
+	if s := int(d.Seconds()); s > 0 {
+		return s
+	}
+	return 1
 }
 
 /*

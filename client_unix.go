@@ -50,7 +50,16 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 	logger, logFlusher := logging.GetDefaultLogger(), logging.GetDefaultFlusher()
 	if options.Logger == nil {
 		if options.LogPath != "" {
-			logger, logFlusher, _ = logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			// FIX L-8: see createListeners in gnet.go — the error was discarded, and
+			// installing the (nil, nil) pair it returns on failure made every later
+			// logging call panic on a nil receiver.
+			fileLogger, fileFlusher, logErr := logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			if logErr != nil {
+				logging.Errorf("failed to create a logger on %s, keeping the current logger: %v",
+					options.LogPath, logErr)
+			} else {
+				logger, logFlusher = fileLogger, fileFlusher
+			}
 		}
 		options.Logger = logger
 	} else {
@@ -66,7 +75,7 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 		opts:         options,
 		turnOff:      shutdown,
 		eventHandler: eh,
-		eventLoops:   new(leastConnectionsLoadBalancer),
+		eventLoops:   newLoadBalancerForClient(options.LB),
 		concurrency: struct {
 			*errgroup.Group
 			ctx context.Context

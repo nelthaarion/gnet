@@ -49,10 +49,13 @@ func (cm *connMatrix) loadCount() (n int32) {
 	return atomic.LoadInt32(&cm.connCount)
 }
 
-func (cm *connMatrix) addConn(c *conn, index int) {
+// addConn registers c in the map.  Unlike the matrix-backed implementation this
+// one grows on demand, so it never runs out of room and never fails.
+func (cm *connMatrix) addConn(c *conn, index int) error {
 	c.gfd = gfd.NewGFD(c.fd, index, 0, 0)
 	cm.connMap[c.fd] = c
 	cm.incCount(0, 1)
+	return nil
 }
 
 func (cm *connMatrix) delConn(c *conn) {

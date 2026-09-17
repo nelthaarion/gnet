@@ -22,7 +22,6 @@ import (
 
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 	"github.com/nelthaarion/gnet/v2/pkg/logging"
-	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 type Client struct {
@@ -37,7 +36,16 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 	logger, logFlusher := logging.GetDefaultLogger(), logging.GetDefaultFlusher()
 	if options.Logger == nil {
 		if options.LogPath != "" {
-			logger, logFlusher, _ = logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			// FIX L-8: see createListeners in gnet.go — the error was discarded, and
+			// installing the (nil, nil) pair it returns on failure made every later
+			// logging call panic on a nil receiver.
+			fileLogger, fileFlusher, logErr := logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			if logErr != nil {
+				logging.Errorf("failed to create a logger on %s, keeping the current logger: %v",
+					options.LogPath, logErr)
+			} else {
+				logger, logFlusher = fileLogger, fileFlusher
+			}
 		}
 		options.Logger = logger
 	} else {
@@ -53,7 +61,7 @@ func NewClient(eh EventHandler, opts ...Option) (cli *Client, err error) {
 		opts:         options,
 		turnOff:      shutdown,
 		eventHandler: eh,
-		eventLoops:   new(leastConnectionsLoadBalancer),
+		eventLoops:   newLoadBalancerForClient(options.LB),
 		concurrency: struct {
 			*errgroup.Group
 			ctx context.Context
@@ -138,8 +146,29 @@ func (cli *Client) Enroll(nc net.Conn) (gc Conn, err error) {
 }
 
 func (cli *Client) EnrollContext(nc net.Conn, ctx any) (gc Conn, err error) {
+	if nc == nil {
+		return nil, errorx.ErrInvalidNetConn
+	}
+	if cli.eng.isShutdown() {
+		return nil, errorx.ErrEngineInShutdown
+	}
 	el := cli.eng.eventLoops.next(nil)
-	connOpened := make(chan struct{})
+	connOpened := make(chan error, 1)
+	publish := func(c *conn, udp bool) error {
+		if err := el.enqueue(&openConn{c: c, cb: func(err error) { connOpened <- err }}); err != nil {
+			_ = nc.Close()
+			c.release()
+			return err
+		}
+		if err := <-connOpened; err != nil {
+			return err
+		}
+		if err := el.readLoop(nc, c, ctx, udp); err != nil {
+			_ = el.enqueue(&netErr{c, err})
+			return err
+		}
+		return nil
+	}
 	switch v := nc.(type) {
 	case *net.TCPConn:
 		if cli.opts.TCPNoDelay == TCPNoDelay {
@@ -162,54 +191,24 @@ func (cli *Client) EnrollContext(nc net.Conn, ctx any) (gc Conn, err error) {
 				return
 			}
 		}
-		el.ch <- &openConn{c: c, cb: func() { close(connOpened) }}
-		goroutine.DefaultWorkerPool.Submit(func() {
-			var buffer [0x10000]byte
-			for {
-				n, err := nc.Read(buffer[:])
-				if err != nil {
-					el.ch <- &netErr{c, err}
-					return
-				}
-				el.ch <- packTCPConn(c, buffer[:n])
-			}
-		})
+		if err = publish(c, false); err != nil {
+			return nil, err
+		}
 		gc = c
 	case *net.UnixConn:
 		c := newStreamConn(el, nc, ctx)
-		el.ch <- &openConn{c: c, cb: func() { close(connOpened) }}
-		goroutine.DefaultWorkerPool.Submit(func() {
-			var buffer [0x10000]byte
-			for {
-				n, err := nc.Read(buffer[:])
-				if err != nil {
-					el.ch <- &netErr{c, err}
-					return
-				}
-				el.ch <- packTCPConn(c, buffer[:n])
-			}
-		})
+		if err = publish(c, false); err != nil {
+			return nil, err
+		}
 		gc = c
 	case *net.UDPConn:
 		c := newUDPConn(el, nil, nc, nc.LocalAddr(), nc.RemoteAddr(), ctx)
-		el.ch <- &openConn{c: c, cb: func() { close(connOpened) }}
-		goroutine.DefaultWorkerPool.Submit(func() {
-			var buffer [0x10000]byte
-			for {
-				n, err := nc.Read(buffer[:])
-				if err != nil {
-					el.ch <- &netErr{c, err}
-					return
-				}
-				c := newUDPConn(el, nil, nc, nc.LocalAddr(), nc.RemoteAddr(), ctx)
-				el.ch <- packUDPConn(c, buffer[:n])
-			}
-		})
+		if err = publish(c, true); err != nil {
+			return nil, err
+		}
 		gc = c
 	default:
 		return nil, errorx.ErrUnsupportedProtocol
 	}
-	<-connOpened
-
 	return
 }

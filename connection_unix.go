@@ -50,6 +50,7 @@ type conn struct {
 	inboundBuffer  elastic.RingBuffer     // buffer for leftover data from the remote
 	buffer         []byte                 // buffer for the latest bytes
 	cache          []byte                 // temporary cache for the inbound data (owned by bsPool, freed by Discard/release)
+	peekCaches     [][]byte               // allocated Peek results, valid until Discard/release
 	isDatagram     bool                   // UDP protocol
 	opened         bool                   // connection opened event fired
 	isEOF          bool                   // whether the connection has reached EOF
@@ -89,6 +90,7 @@ func newUDPConn(fd int, el *eventloop, localAddr net.Addr, sa unix.Sockaddr, con
 }
 
 func (c *conn) release() {
+	c.releasePeekCaches()
 	c.opened = false
 	c.isEOF = false
 	c.ctx = nil
@@ -216,12 +218,27 @@ func (c *conn) writev(bs [][]byte) (n int, err error) {
 		return
 	}
 
+	// FIX M-2: writev(2) rejects an iovec list longer than IOV_MAX (1024 on Linux
+	// and the BSDs) with EINVAL, and this method treats every error other than
+	// EAGAIN as fatal — the deferred handler below closes the connection over it. So
+	// a caller passing more than 1024 buffers lost its connection to a call that is
+	// perfectly legal at the API level. Only the first IOV_MAX entries are handed to
+	// the kernel; the remainder is carried in overflow and appended to the outbound
+	// buffer with whatever else could not be sent in this round.
+	var overflow [][]byte
+	if len(bs) > iovMax {
+		overflow = bs[iovMax:]
+		bs = bs[:iovMax]
+	}
+
 	defer func() {
 		if err != nil {
 			_ = c.loop.close(c, os.NewSyscallError("writev", err))
 		}
 	}()
 
+	// remaining counts every byte handed to this method, including the overflow that
+	// is never attempted, so the tail of the function buffers exactly what is left.
 	remaining := n
 	var sent int
 loop:
@@ -230,6 +247,11 @@ loop:
 		// writing it back to the remote in the next round for LT mode.
 		if err == unix.EAGAIN {
 			_, err = c.outboundBuffer.Writev(bs)
+			if len(overflow) > 0 {
+				if _, werr := c.outboundBuffer.Writev(overflow); err == nil {
+					err = werr
+				}
+			}
 			if !isET {
 				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
 			}
@@ -251,14 +273,20 @@ loop:
 	}
 	bs = bs[pos:]
 	// FIX P-4 (writev): Same guard as write() above — only loop again if
-	// progress was made, preventing an infinite spin under congestion.
-	if isET && remaining > 0 && sent > 0 {
+	// progress was made, preventing an infinite spin under congestion. Only loop
+	// when there is still something to send: once the kernel has taken every
+	// iovec, bs is empty and another writev would be a no-op that reports no
+	// progress.
+	if isET && remaining > 0 && sent > 0 && len(bs) > 0 {
 		goto loop
 	}
 
 	// Failed to send all data back to the remote, buffer the leftover data for the next round.
 	if remaining > 0 {
 		_, _ = c.outboundBuffer.Writev(bs)
+		if len(overflow) > 0 {
+			_, _ = c.outboundBuffer.Writev(overflow)
+		}
 		err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
 	}
 
@@ -402,17 +430,15 @@ func (c *conn) Peek(n int) (buf []byte, err error) {
 	buf = bsPool.Get(n)[:0]
 	buf = append(buf, head...)
 	buf = append(buf, tail...)
-	if inBufferLen >= n {
-		return
+	if inBufferLen < n {
+		buf = append(buf, c.buffer[:n-inBufferLen]...)
 	}
-
-	remaining := n - inBufferLen
-	buf = append(buf, c.buffer[:remaining]...)
-	c.cache = buf
+	c.peekCaches = append(c.peekCaches, buf)
 	return
 }
 
 func (c *conn) Discard(n int) (int, error) {
+	c.releasePeekCaches()
 	if len(c.cache) > 0 {
 		bsPool.Put(c.cache)
 		c.cache = nil

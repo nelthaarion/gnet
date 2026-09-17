@@ -48,4 +48,8 @@ var (
 	ErrInvalidNetConn = errors.New("gnet: the net.Conn is empty")
 	// ErrNilRunnable occurs when trying to execute a nil runnable.
 	ErrNilRunnable = errors.New("gnet: nil runnable is not allowed")
+	// ErrConnMatrixFull occurs when the connection matrix of an event-loop has no free slot left (gc_opt builds only).
+	ErrConnMatrixFull = errors.New("gnet: the connection matrix of the event-loop is full")
+	// ErrPollerClosed occurs when trying to use a poller that has already been closed.
+	ErrPollerClosed = errors.New("gnet: the poller is closed")
 )

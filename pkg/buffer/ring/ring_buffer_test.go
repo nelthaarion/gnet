@@ -302,6 +302,54 @@ func TestRingBuffer_ByteInterface(t *testing.T) {
 	assert.False(t, rb.IsFull(), "expect IsFull is false but got true")
 }
 
+// TestRingBuffer_WriteByteOnFullBuffer covers the grow path that WriteByte takes
+// on a buffer of bufferGrowThreshold bytes or more.  grow() only grows while
+// n < newCap, so a request for a single extra byte on such a buffer produced
+// newCap == rb.size: the buffer was "resized" to the capacity it already had
+// while the write cursor was reset to rb.size, and the very next store indexed
+// rb.buf[rb.size] and panicked with "index out of range".
+func TestRingBuffer_WriteByteOnFullBuffer(t *testing.T) {
+	for _, size := range []int{bufferGrowThreshold, bufferGrowThreshold + 1, 5 * DefaultBufferSize, 3 * bufferGrowThreshold} {
+		rb := New(size)
+		full := rb.Cap()
+		data := make([]byte, full)
+		_, err := crand.Read(data)
+		require.NoError(t, err)
+		n, err := rb.Write(data)
+		require.NoError(t, err)
+		require.EqualValues(t, full, n)
+		require.Truef(t, rb.IsFull(), "the %d-byte buffer should be full", full)
+
+		// The buffer has no room left at all: this is the case that panicked.
+		require.NotPanicsf(t, func() { _ = rb.WriteByte('z') }, "WriteByte panicked on a full %d-byte buffer", full)
+		require.EqualValuesf(t, full+1, rb.Buffered(), "the byte should have been appended")
+		require.GreaterOrEqualf(t, rb.Cap(), full+full/4,
+			"WriteByte should grow the buffer by a quarter, not keep it at its current capacity")
+
+		// The buffered bytes must survive the resize, with the new byte appended.
+		buf := make([]byte, full+1)
+		read, err := rb.Read(buf)
+		require.NoError(t, err)
+		require.EqualValues(t, full+1, read)
+		require.Equal(t, append(data, 'z'), buf, "the buffered bytes were lost by the resize")
+	}
+
+	// A long run of single-byte writes must stay amortised: the capacity may only
+	// grow in steps, never once per byte written.
+	rb := New(bufferGrowThreshold)
+	fill := make([]byte, rb.Cap())
+	_, err := crand.Read(fill)
+	require.NoError(t, err)
+	_, err = rb.Write(fill)
+	require.NoError(t, err)
+	for i := 0; i < 4*bufferGrowThreshold; i++ {
+		require.NoError(t, rb.WriteByte(byte('a' + i%26)))
+	}
+	require.EqualValues(t, 5*bufferGrowThreshold, rb.Buffered())
+	require.LessOrEqualf(t, rb.Cap(), 3*5*bufferGrowThreshold,
+		"the buffer grew to %d bytes for %d bytes written", rb.Cap(), rb.Buffered())
+}
+
 func TestRingBuffer_ReadFrom(t *testing.T) {
 	rb := New(0)
 	const dataLen = 4 * 1024

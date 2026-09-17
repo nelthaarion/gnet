@@ -78,6 +78,7 @@
 package queue
 
 import (
+	"runtime"
 	"sync/atomic"
 	"unsafe"
 )
@@ -100,9 +101,21 @@ func NewLockFreeQueue() AsyncTaskQueue {
 	return &lockFreeQueue{head: n, tail: n}
 }
 
+// maxSpinBeforeYield bounds how many times the retry loops below may spin on a
+// lost CAS before yielding the processor. The common case is uncontended — one
+// CAS succeeds on the first attempt and the counter is never reached — so this
+// costs nothing when the queue is quiet, while under heavy contention it stops a
+// producer from monopolising a core that the consumer it is waiting for needs.
+//
+// FIX L-11: the loops previously retried with nothing but `goto retry`, which on
+// a single-core or GOMAXPROCS-starved machine can spin until the scheduler
+// preempts on its own.
+const maxSpinBeforeYield = 64
+
 // Enqueue puts the given value v at the tail of the queue.
 func (q *lockFreeQueue) Enqueue(task *Task) {
 	n := &node{value: task}
+	spin := 0
 retry:
 	tail := load(&q.tail)
 	next := load(&tail.next)
@@ -121,12 +134,17 @@ retry:
 			cas(&q.tail, tail, next)
 		}
 	}
+	if spin++; spin > maxSpinBeforeYield {
+		spin = 0
+		runtime.Gosched()
+	}
 	goto retry
 }
 
 // Dequeue removes and returns the value at the head of the queue.
 // It returns nil if the queue is empty.
 func (q *lockFreeQueue) Dequeue() *Task {
+	spin := 0
 retry:
 	head := load(&q.head)
 	tail := load(&q.tail)
@@ -149,6 +167,10 @@ retry:
 			}
 		}
 	}
+	if spin++; spin > maxSpinBeforeYield {
+		spin = 0
+		runtime.Gosched()
+	}
 	goto retry
 }
 
@@ -158,6 +180,17 @@ func (q *lockFreeQueue) IsEmpty() bool {
 }
 
 // Length returns the number of elements in the queue.
+//
+// FIX L-11: this count is not linearizable and must not be used as a
+// synchronization primitive. Enqueue links the new node before incrementing, and
+// Dequeue unlinks before decrementing, so a reader can observe a transient
+// negative value (a dequeue that already succeeded counted against an enqueue
+// that has not counted yet). That is harmless for the only caller — the poller
+// uses it to decide whether to re-arm its wakeup, where an early read can only
+// produce an extra, spurious wakeup, never a lost task; the task queues
+// themselves are drained to exhaustion rather than by count. Treat it as a hint,
+// not a fact: a non-zero reading guarantees nothing, and an empty reading does
+// not guarantee the queue is drained.
 func (q *lockFreeQueue) Length() int32 {
 	return atomic.LoadInt32(&q.length)
 }

@@ -46,13 +46,19 @@ var DefaultWorkerPool = Default()
 // Pool is the alias of ants.Pool.
 type Pool = ants.Pool
 
-type antsLogger struct {
-	logging.Logger
-}
+// antsLogger adapts the logging package to the ants.Logger interface.
+//
+// FIX L-11: it used to embed the logging.Logger that was installed when this
+// package was initialised — which happens before gnet applies WithLogger() in
+// createListeners. The pool therefore kept writing through the process default
+// for its whole life and a user-supplied logger never saw a single line from it.
+// Resolving the logger per call instead means the pool follows the same logger as
+// the rest of the library, including a later SetDefaultLoggerAndFlusher.
+type antsLogger struct{}
 
 // Printf implements the ants.Logger interface.
-func (l antsLogger) Printf(format string, args ...any) {
-	l.Infof(format, args...)
+func (antsLogger) Printf(format string, args ...any) {
+	logging.Infof(format, args...)
 }
 
 // Default instantiates a non-blocking goroutine pool with the capacity of DefaultAntsPoolSize.
@@ -60,7 +66,7 @@ func Default() *Pool {
 	options := ants.Options{
 		ExpiryDuration: ExpiryDuration,
 		Nonblocking:    Nonblocking,
-		Logger:         &antsLogger{logging.GetDefaultLogger()},
+		Logger:         antsLogger{},
 		PanicHandler: func(a any) {
 			logging.Errorf("goroutine pool panic: %v", a)
 		},

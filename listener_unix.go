@@ -122,7 +122,12 @@ func initListener(network, addr string, options *Options) (ln *listener, err err
 	}
 
 	ln = &listener{network: network, address: addr, sockOptInts: sockOptInts, sockOptStrs: sockOptStrs}
-	err = ln.open()
+	if err = ln.open(); err != nil {
+		// Return the error of open() as it is: the keepalive branch below used to
+		// run even when the socket was never created, replacing this error with
+		// whatever setsockopt(0) returned.
+		return
+	}
 
 	if options.TCPKeepAlive > 0 && ln.network == "tcp" &&
 		(runtime.GOOS == "linux" || runtime.GOOS == "freebsd" || runtime.GOOS == "dragonfly") {
@@ -130,12 +135,17 @@ func initListener(network, addr string, options *Options) (ln *listener, err err
 		// only when running on Linux, FreeBSD, or DragonFlyBSD.
 		//
 		// Check out https://github.com/nginx/nginx/pull/337 for details.
-		err = setKeepAlive(
+		if err = setKeepAlive(
 			ln.fd,
 			true,
 			options.TCPKeepAlive,
 			options.TCPKeepInterval,
-			options.TCPKeepCount)
+			options.TCPKeepCount); err != nil {
+			// The socket is open but not configured as requested; close it so the
+			// caller does not have to clean up half-built listeners.
+			ln.close()
+			return
+		}
 	}
 
 	return

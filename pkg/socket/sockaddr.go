@@ -166,13 +166,24 @@ func itod(v uint) string {
 		return "0"
 	}
 	// Assemble decimal in reverse order.
+	//
+	// The buffer comes from a pool whose Get does not clear the memory it hands
+	// back, so the digits must start at buf[i+1], not buf[i]: buf[i] is the last
+	// byte written, and everything before it is stale data belonging to whatever
+	// previously used that block.  Returning buf[i:] exposed one such byte in
+	// front of the number (an IPv6 zone that does not resolve to an interface
+	// name used to come back as e.g. "\xaa7" instead of "7").
+	//
+	// Note that the buffer is deliberately not returned to the pool: the string
+	// aliases it through BytesToString, so putting it back would let another
+	// caller overwrite the bytes of a string that is still in use.
 	buf := bsPool.Get(32)
 	i := len(buf) - 1
 	for ; v > 0; v /= 10 {
 		buf[i] = byte(v%10 + '0')
 		i--
 	}
-	return bs.BytesToString(buf[i:])
+	return bs.BytesToString(buf[i+1:])
 }
 
 // Bigger than we need, not too big to worry about overflow.

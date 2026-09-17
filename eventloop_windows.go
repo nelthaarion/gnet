@@ -20,15 +20,23 @@ import (
 	"fmt"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 	"github.com/nelthaarion/gnet/v2/pkg/logging"
+	bbPool "github.com/nelthaarion/gnet/v2/pkg/pool/bytebuffer"
+	bsPool "github.com/nelthaarion/gnet/v2/pkg/pool/byteslice"
 	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
+// maxUDPDatagramSize is the largest payload a UDP datagram can carry.
+const maxUDPDatagramSize = 0x10000
+
 type eventloop struct {
+	submitMu     sync.RWMutex
+	stopped      bool
 	ch           chan any           // channel for event-loop
 	idx          int                // index of event-loop in event-loops
 	eng          *engine            // engine in loop
@@ -64,10 +72,11 @@ func (el *eventloop) Execute(ctx context.Context, runnable Runnable) error {
 	if runnable == nil {
 		return errorx.ErrNilRunnable
 	}
-	return goroutine.DefaultWorkerPool.Submit(func() {
-		el.ch <- func() error {
-			return runnable.Run(ctx)
+	return el.submit(func() error {
+		if el.eng.beingShutdown.Load() {
+			return errorx.ErrEngineInShutdown
 		}
+		return runnable.Run(ctx)
 	})
 }
 
@@ -96,45 +105,99 @@ func (el *eventloop) enroll(c net.Conn, addr net.Addr, ctx any) (resCh chan Regi
 			}
 		}
 
-		connOpened := make(chan struct{})
+		connOpened := make(chan error, 1)
+		udp := false
 		var gc *conn
 		switch addr.Network() {
 		case "tcp", "tcp4", "tcp6", "unix":
 			gc = newStreamConn(el, c, ctx)
-			el.ch <- &openConn{c: gc, cb: func() { close(connOpened) }}
-			goroutine.DefaultWorkerPool.Submit(func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.Read(buffer[:])
-					if err != nil {
-						el.ch <- &netErr{gc, err}
-						return
-					}
-					el.ch <- packTCPConn(gc, buffer[:n])
-				}
-			})
 		case "udp", "udp4", "udp6":
+			udp = true
 			gc = newUDPConn(el, nil, c, c.LocalAddr(), c.RemoteAddr(), ctx)
-			el.ch <- &openConn{c: gc, cb: func() { close(connOpened) }}
-			goroutine.DefaultWorkerPool.Submit(func() {
-				var buffer [0x10000]byte
-				for {
-					n, err := c.Read(buffer[:])
-					if err != nil {
-						el.ch <- &netErr{gc, err}
-						return
-					}
-					gc := newUDPConn(el, nil, c, c.LocalAddr(), c.RemoteAddr(), ctx)
-					el.ch <- packUDPConn(gc, buffer[:n])
-				}
-			})
+		default:
+			// This branch used to fall through with gc left nil and no openConn
+			// sent, so the `<-connOpened` below waited on a callback nothing would
+			// ever run — a permanent hang of the calling goroutine.  It is reachable
+			// whenever net.Dial understands a network this switch does not, such as
+			// "unixpacket".
+			_ = c.Close()
+			resCh <- RegisteredResult{Err: errorx.ErrUnsupportedProtocol}
+			return
 		}
 
-		<-connOpened
-
+		// The reader has to start after the connection is published: it feeds
+		// inbound data back as *tcpConn/*udpConn, and read() drops those for a
+		// connection the loop does not know yet.
+		if err = el.enqueue(&openConn{c: gc, cb: func(err error) { connOpened <- err }}); err != nil {
+			_ = c.Close()
+			gc.release()
+			resCh <- RegisteredResult{Err: err}
+			return
+		}
+		if err = <-connOpened; err != nil {
+			resCh <- RegisteredResult{Err: err}
+			return
+		}
+		if err = el.readLoop(c, gc, ctx, udp); err != nil {
+			_ = el.enqueue(&netErr{gc, err})
+			resCh <- RegisteredResult{Err: err}
+			return
+		}
 		resCh <- RegisteredResult{Conn: gc}
 	})
 	return
+}
+
+// readLoop pumps data from nc into the event-loop until reading fails.
+//
+// FIX M-3: each reader used to own a `var buffer [0x10000]byte`, i.e. 64KB of its
+// own for every connection regardless of what WithReadBufferCap asked for, resident
+// for as long as the connection lived.  The buffer now comes from the shared slice
+// pool, sized by the option for streams — a UDP socket cannot shrink it, since a
+// datagram may legitimately be up to 65507 bytes and a smaller buffer would
+// truncate it silently — and is returned to the pool when the reader stops.
+//
+// FIX M-4: the error from submitting the reader is returned rather than dropped, so
+// a connection whose reader never started is reported to the caller instead of
+// staying open and unread.
+//
+// ctx is the user context recorded on the connection; it is only used to build the
+// fresh per-datagram connections of the UDP case, matching what the callers did
+// inline before.
+func (el *eventloop) readLoop(nc net.Conn, c *conn, ctx any, udp bool) error {
+	bufCap := el.eng.opts.ReadBufferCap
+	if udp {
+		bufCap = maxUDPDatagramSize
+	} else if bufCap <= 0 {
+		bufCap = MaxStreamBufferCap
+	}
+	err := goroutine.DefaultWorkerPool.Submit(func() {
+		buffer := bsPool.Get(bufCap)
+		defer bsPool.Put(buffer)
+		for {
+			n, readErr := nc.Read(buffer)
+			if n > 0 || (udp && readErr == nil) {
+				if udp {
+					uc := newUDPConn(el, nil, nc, nc.LocalAddr(), nc.RemoteAddr(), ctx)
+					if err := el.enqueue(packUDPConn(uc, buffer[:n])); err != nil {
+						uc.release()
+						return
+					}
+				} else {
+					tc := packTCPConn(c, buffer[:n])
+					if err := el.enqueue(tc); err != nil {
+						bbPool.Put(tc.b)
+						return
+					}
+				}
+			}
+			if readErr != nil {
+				_ = el.enqueue(&netErr{c, readErr})
+				return
+			}
+		}
+	})
+	return err
 }
 
 func (el *eventloop) incConn(delta int32) {
@@ -148,9 +211,13 @@ func (el *eventloop) countConn() int32 {
 func (el *eventloop) run() (err error) {
 	defer func() {
 		el.eng.shutdown(err)
+		el.submitMu.Lock()
+		el.stopped = true
+		el.submitMu.Unlock()
 		for c := range el.connections {
 			_ = el.close(c, nil)
 		}
+		el.finishPending()
 	}()
 
 	if el.eng.opts.LockOSThread {
@@ -158,7 +225,13 @@ func (el *eventloop) run() (err error) {
 		defer runtime.UnlockOSThread()
 	}
 
-	for i := range el.ch {
+	for {
+		var i any
+		select {
+		case <-el.eng.concurrency.ctx.Done():
+			return nil
+		case i = <-el.ch:
+		}
 		switch v := i.(type) {
 		case error:
 			err = v
@@ -185,9 +258,9 @@ func (el *eventloop) run() (err error) {
 	return nil
 }
 
-func (el *eventloop) open(oc *openConn) error {
+func (el *eventloop) open(oc *openConn) (err error) {
 	if oc.cb != nil {
-		defer oc.cb()
+		defer func() { oc.cb(err) }()
 	}
 
 	c := oc.c
@@ -196,7 +269,8 @@ func (el *eventloop) open(oc *openConn) error {
 
 	out, action := el.eventHandler.OnOpen(c)
 	if out != nil {
-		if _, err := c.rawConn.Write(out); err != nil {
+		if _, err := c.Write(out); err != nil {
+			_ = el.close(c, err)
 			return err
 		}
 	}
@@ -223,11 +297,10 @@ func (el *eventloop) read(c *conn) error {
 }
 
 func (el *eventloop) readUDP(c *conn) error {
-	action := el.eventHandler.OnTraffic(c)
-	if action == Shutdown {
+	defer c.release()
+	if el.eventHandler.OnTraffic(c) == Shutdown {
 		return errorx.ErrEngineShutdown
 	}
-	c.release()
 	return nil
 }
 
@@ -253,7 +326,7 @@ func (el *eventloop) ticker(ctx context.Context) {
 		case Shutdown:
 			if !shutdown {
 				shutdown = true
-				el.ch <- errorx.ErrEngineShutdown
+				el.eng.shutdown(errorx.ErrEngineShutdown)
 				el.getLogger().Debugf("stopping ticker in event-loop(%d) from Tick()", el.idx)
 			}
 		}

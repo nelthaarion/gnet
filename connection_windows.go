@@ -29,7 +29,6 @@ import (
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
 	bbPool "github.com/nelthaarion/gnet/v2/pkg/pool/bytebuffer"
 	bsPool "github.com/nelthaarion/gnet/v2/pkg/pool/byteslice"
-	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 type netErr struct {
@@ -48,7 +47,7 @@ type udpConn struct {
 
 type openConn struct {
 	c  *conn
-	cb func()
+	cb func(error)
 }
 
 type conn struct {
@@ -58,6 +57,7 @@ type conn struct {
 	loop          *eventloop          // owner event-loop
 	buffer        *bbPool.ByteBuffer  // reuse memory of inbound data as a temporary buffer
 	cache         []byte              // temporary cache for the inbound data
+	peekCaches    [][]byte            // allocated Peek results, valid until Discard/release
 	rawConn       net.Conn            // original connection
 	localAddr     net.Addr            // local server addr
 	remoteAddr    net.Addr            // remote addr
@@ -72,6 +72,12 @@ func packTCPConn(c *conn, buf []byte) *tcpConn {
 
 func unpackTCPConn(tc *tcpConn) *conn {
 	if tc.c.buffer == nil { // the connection has been closed
+		// FIX L-9: this returned without releasing tc.b. packTCPConn took that buffer
+		// from bbPool, so whichever branch is taken it has to go back — dropping it
+		// here means the pool is drained by exactly the connections that close early,
+		// which is the common case under load.
+		bbPool.Put(tc.b)
+		tc.b = nil
 		return nil
 	}
 	_, _ = tc.c.buffer.Write(tc.b.B)
@@ -99,6 +105,7 @@ func newStreamConn(el *eventloop, nc net.Conn, ctx any) (c *conn) {
 }
 
 func (c *conn) release() {
+	c.releasePeekCaches()
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.localAddr = nil
@@ -107,6 +114,17 @@ func (c *conn) release() {
 		c.remoteAddr = nil
 	}
 	c.inboundBuffer.Done()
+
+	// FIX P-8 (Windows): Next()/Peek() hand out a slice owned by bsPool and park it
+	// in c.cache until Discard() returns it. A handler that never reaches Discard —
+	// because the connection closed mid-protocol — left that slice to the GC, so the
+	// pool leaked one block per such connection. Return it here, as the unix
+	// implementation does.
+	if len(c.cache) > 0 {
+		bsPool.Put(c.cache)
+		c.cache = nil
+	}
+
 	bbPool.Put(c.buffer)
 	c.buffer = nil
 }
@@ -125,13 +143,26 @@ func newUDPConn(el *eventloop, pc net.PacketConn, rc net.Conn, localAddr, remote
 	return c
 }
 
+// FIX M-5: release() sets c.buffer to nil, and InboundBuffered/WriteTo already
+// tolerate that, but every other buffer access below dereferenced it and panicked.
+// A connection handle is routinely kept by the caller past OnClose (in a map, or in
+// a closed-over variable), so calling Read/Next/Peek/Discard on it is an ordinary
+// mistake, not an impossible one. They now report the connection as closed instead,
+// the same answer Write/SetLinger/... give.
+
 func (c *conn) resetBuffer() {
+	if c.buffer == nil { // the connection has been closed
+		return
+	}
 	c.buffer.Reset()
 	c.inboundBuffer.Reset()
 	c.inboundBuffer.Done()
 }
 
 func (c *conn) Read(p []byte) (n int, err error) {
+	if c.buffer == nil { // the connection has been closed
+		return 0, net.ErrClosed
+	}
 	if c.inboundBuffer.IsEmpty() {
 		n = copy(p, c.buffer.B)
 		c.buffer.B = c.buffer.B[n:]
@@ -151,6 +182,9 @@ func (c *conn) Read(p []byte) (n int, err error) {
 }
 
 func (c *conn) Next(n int) (buf []byte, err error) {
+	if c.buffer == nil { // the connection has been closed
+		return nil, net.ErrClosed
+	}
 	inBufferLen := c.inboundBuffer.Buffered()
 	if totalLen := inBufferLen + c.buffer.Len(); n > totalLen {
 		return nil, io.ErrShortBuffer
@@ -163,12 +197,24 @@ func (c *conn) Next(n int) (buf []byte, err error) {
 		return
 	}
 
+	// FIX P-2 (Windows): the slice obtained from bsPool was never returned to it, so
+	// every Next() served from the inbound buffer leaked one pooled block. Keep the
+	// same contract as the unix implementation: park the slice in c.cache, and let
+	// the next Next()/Discard() or release() return it.
+	if len(c.cache) > 0 {
+		bsPool.Put(c.cache)
+		c.cache = nil
+	}
 	buf = bsPool.Get(n)
 	_, err = c.Read(buf)
+	c.cache = buf
 	return
 }
 
 func (c *conn) Peek(n int) (buf []byte, err error) {
+	if c.buffer == nil { // the connection has been closed
+		return nil, net.ErrClosed
+	}
 	inBufferLen := c.inboundBuffer.Buffered()
 	if totalLen := inBufferLen + c.buffer.Len(); n > totalLen {
 		return nil, io.ErrShortBuffer
@@ -185,20 +231,22 @@ func (c *conn) Peek(n int) (buf []byte, err error) {
 	buf = bsPool.Get(n)[:0]
 	buf = append(buf, head...)
 	buf = append(buf, tail...)
-	if inBufferLen >= n {
-		return
+	if inBufferLen < n {
+		buf = append(buf, c.buffer.B[:n-inBufferLen]...)
 	}
-
-	remaining := n - inBufferLen
-	buf = append(buf, c.buffer.B[:remaining]...)
-	c.cache = buf
+	c.peekCaches = append(c.peekCaches, buf)
 	return
 }
 
 func (c *conn) Discard(n int) (int, error) {
+	c.releasePeekCaches()
 	if len(c.cache) > 0 {
 		bsPool.Put(c.cache)
 		c.cache = nil
+	}
+
+	if c.buffer == nil { // the connection has been closed
+		return 0, net.ErrClosed
 	}
 
 	inBufferLen := c.inboundBuffer.Buffered()
@@ -221,6 +269,28 @@ func (c *conn) Discard(n int) (int, error) {
 	c.buffer.B = c.buffer.B[remaining:]
 	return n, nil
 }
+
+// ── Windows write path: a documented limitation ───────────────────────────────
+//
+// FIX L-9: the Windows backend has no outbound buffering. Write/Writev call
+// net.Conn.Write directly, on the event-loop goroutine, and block there until the
+// kernel accepts every byte; OutboundBuffered always reports 0 and Flush is a
+// no-op because there is nothing queued to flush.
+//
+// The consequence is head-of-line blocking: one connection whose peer stops
+// reading occupies its event-loop for as long as the socket send buffer stays
+// full, and every other connection on that loop waits behind it. There is also no
+// backpressure signal — OutboundBuffered() cannot tell an application to slow
+// down, because nothing is ever buffered.
+//
+// This is stated plainly rather than papered over, because it is a real
+// behavioural difference from the unix build, where writes go through
+// conn.outboundBuffer and Write returns as soon as the kernel takes what it will.
+// Fixing it properly means giving each Windows connection an outbound buffer plus
+// a serialized writer (otherwise two concurrent Writes could interleave on the
+// wire), which is a redesign of this backend rather than a patch; it is left as
+// that, deliberately. Applications that must not block a loop should size their
+// writes to what the peer drains and treat OutboundBuffered() as always zero.
 
 func (c *conn) Write(p []byte) (int, error) {
 	if c.rawConn == nil && c.pc == nil {
@@ -274,13 +344,23 @@ func (c *conn) WriteTo(w io.Writer) (n int64, err error) {
 		}
 	}
 
-	if c.buffer == nil {
-		return 0, nil
+	if c.buffer == nil || len(c.buffer.B) == 0 {
+		return n, nil
 	}
-	defer c.buffer.Reset()
-	return c.buffer.WriteTo(w)
+	m, writeErr := w.Write(c.buffer.B)
+	if m < 0 || m > len(c.buffer.B) {
+		panic("Conn.WriteTo: invalid Write count")
+	}
+	n += int64(m)
+	c.buffer.B = c.buffer.B[m:]
+	if writeErr == nil && len(c.buffer.B) > 0 {
+		writeErr = io.ErrShortWrite
+	}
+	return n, writeErr
 }
 
+// Flush is a no-op on Windows: see "Windows write path" above. There is no
+// outbound buffer for it to drain.
 func (c *conn) Flush() error {
 	return nil
 }
@@ -292,6 +372,8 @@ func (c *conn) InboundBuffered() int {
 	return c.inboundBuffer.Buffered() + c.buffer.Len()
 }
 
+// OutboundBuffered always returns 0 on Windows: see "Windows write path" above.
+// Writes are synchronous, so no data is ever held by the library.
 func (c *conn) OutboundBuffered() int {
 	return 0
 }
@@ -306,7 +388,15 @@ func (c *conn) Fd() (fd int) {
 		return -1
 	}
 
-	rc, err := c.rawConn.(syscall.Conn).SyscallConn()
+	// FIX L-9: this assertion used to be unchecked, so any net.Conn that does not
+	// implement syscall.Conn — a user wrapper, a TLS conn, a test double passed to
+	// Enroll — panicked inside the event-loop instead of reporting no descriptor.
+	// Dup() right below has always checked it; do the same here.
+	sc, ok := c.rawConn.(syscall.Conn)
+	if !ok {
+		return -1
+	}
+	rc, err := sc.SyscallConn()
 	if err != nil {
 		return -1
 	}
@@ -475,17 +565,7 @@ func (c *conn) AsyncWrite(buf []byte, cb AsyncCallback) error {
 		return err
 	}
 
-	var err error
-	select {
-	case c.loop.ch <- fn:
-	default:
-		// If the event-loop channel is full, asynchronize this operation to avoid blocking the eventloop.
-		err = goroutine.DefaultWorkerPool.Submit(func() {
-			c.loop.ch <- fn
-		})
-	}
-
-	return err
+	return c.loop.submit(fn)
 }
 
 func (c *conn) AsyncWritev(bs [][]byte, cb AsyncCallback) error {
@@ -497,13 +577,17 @@ func (c *conn) AsyncWritev(bs [][]byte, cb AsyncCallback) error {
 	for _, b := range bs {
 		_, _ = buf.Write(b)
 	}
-	return c.AsyncWrite(buf.Bytes(), func(c Conn, err error) error {
+	err := c.AsyncWrite(buf.Bytes(), func(c Conn, err error) error {
 		defer bbPool.Put(buf)
 		if cb == nil {
 			return err
 		}
 		return cb(c, err)
 	})
+	if err != nil {
+		bbPool.Put(buf)
+	}
+	return err
 }
 
 func (c *conn) Wake(cb AsyncCallback) (err error) {
@@ -515,16 +599,7 @@ func (c *conn) Wake(cb AsyncCallback) (err error) {
 		return
 	}
 
-	select {
-	case c.loop.ch <- wakeFn:
-	default:
-		// If the event-loop channel is full, asynchronize this operation to avoid blocking the eventloop.
-		err = goroutine.DefaultWorkerPool.Submit(func() {
-			c.loop.ch <- wakeFn
-		})
-	}
-
-	return
+	return c.loop.submit(wakeFn)
 }
 
 func (c *conn) Close() (err error) {
@@ -532,16 +607,7 @@ func (c *conn) Close() (err error) {
 		return c.loop.close(c, nil)
 	}
 
-	select {
-	case c.loop.ch <- closeFn:
-	default:
-		// If the event-loop channel is full, asynchronize this operation to avoid blocking the eventloop.
-		err = goroutine.DefaultWorkerPool.Submit(func() {
-			c.loop.ch <- closeFn
-		})
-	}
-
-	return
+	return c.loop.submit(closeFn)
 }
 
 func (c *conn) CloseWithCallback(cb AsyncCallback) (err error) {
@@ -553,16 +619,7 @@ func (c *conn) CloseWithCallback(cb AsyncCallback) (err error) {
 		return
 	}
 
-	select {
-	case c.loop.ch <- closeFn:
-	default:
-		// If the event-loop channel is full, asynchronize this operation to avoid blocking the eventloop.
-		err = goroutine.DefaultWorkerPool.Submit(func() {
-			c.loop.ch <- closeFn
-		})
-	}
-
-	return
+	return c.loop.submit(closeFn)
 }
 
 func (c *conn) EventLoop() EventLoop {

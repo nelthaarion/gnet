@@ -20,7 +20,6 @@ import (
 	"runtime"
 
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
-	"github.com/nelthaarion/gnet/v2/pkg/pool/goroutine"
 )
 
 func (eng *engine) listenStream(ln net.Listener) (err error) {
@@ -45,18 +44,18 @@ func (eng *engine) listenStream(ln net.Listener) (err error) {
 		}
 		el := eng.eventLoops.next(tc.RemoteAddr())
 		c := newStreamConn(el, tc, nil)
-		el.ch <- &openConn{c: c}
-		goroutine.DefaultWorkerPool.Submit(func() {
-			var buffer [0x10000]byte
-			for {
-				n, err := tc.Read(buffer[:])
-				if err != nil {
-					el.ch <- &netErr{c, err}
-					return
-				}
-				el.ch <- packTCPConn(c, buffer[:n])
-			}
-		})
+		if err := el.enqueue(&openConn{c: c}); err != nil {
+			_ = tc.Close()
+			c.release()
+			return nil
+		}
+		// FIX M-3/M-4: this reader had its own fixed 64KB buffer per connection and
+		// its Submit error was dropped, so a refused task left the connection open
+		// with nobody reading it.  readLoop pools the buffer and reports the error,
+		// which is handed to the event-loop to close the connection.
+		if err := el.readLoop(tc, c, nil, false); err != nil {
+			_ = el.enqueue(&netErr{c, err})
+		}
 	}
 }
 
@@ -83,6 +82,9 @@ func (eng *engine) ListenUDP(pc net.PacketConn) (err error) {
 		}
 		el := eng.eventLoops.next(addr)
 		c := newUDPConn(el, pc, nil, pc.LocalAddr(), addr, nil)
-		el.ch <- packUDPConn(c, buffer[:n])
+		if err := el.enqueue(packUDPConn(c, buffer[:n])); err != nil {
+			c.release()
+			return nil
+		}
 	}
 }

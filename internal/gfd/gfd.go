@@ -29,6 +29,17 @@ import (
 )
 
 // Constants for GFD.
+//
+// FIX L-5: these are the hard limits of the packed layout, and every setter below
+// truncates to them without checking. There is no room for an error return in
+// NewGFD/UpdateIndexes without changing their signatures, so the constraint is
+// stated here instead and the one place that could violate it is called out:
+// WithLockOSThread accepts up to 10,000 event-loops (see createListeners), which
+// is far more than EventLoopIndexMax, so anything that revives gfd.EventLoopIndex
+// as a loop index aliases every loop ≥ 256 onto a lower one. The field is written
+// and never read today — the only reader sits in a commented-out block in
+// connection_unix.go — so nothing is broken yet. Re-check this before that
+// reader comes back.
 const (
 	ConnMatrixColumnOffset = 2
 	SequenceOffset         = 4
@@ -75,12 +86,22 @@ func (gfd GFD) Sequence() uint32 {
 }
 
 // UpdateIndexes updates the connStore indexes.
+//
+// FIX L-5: row and column are truncated to one and two bytes respectively. The
+// callers in conn_matrix.go stay inside ConnMatrixRowMax/ConnMatrixColumnMax by
+// construction, so the truncation is unreachable there; see the constants above.
 func (gfd *GFD) UpdateIndexes(row, column int) {
 	(*gfd)[1] = byte(row)
 	binary.BigEndian.PutUint16((*gfd)[ConnMatrixColumnOffset:SequenceOffset], uint16(column))
 }
 
 // Validate checks if the GFD is valid.
+//
+// FIX L-5: this has no callers inside gnet — it is a helper for consumers of the
+// package, and it is the only check that would notice a truncated index, since
+// the truncating setters cannot report one. Note that it is not a substitute for
+// the constructors' limits: a value that was truncated on the way in can still
+// look self-consistent here, because it was truncated to something in range.
 func (gfd GFD) Validate() bool {
 	return gfd.Fd() > 2 && gfd.Fd() <= math.MaxInt &&
 		gfd.EventLoopIndex() >= 0 && gfd.EventLoopIndex() < EventLoopIndexMax &&
@@ -90,6 +111,10 @@ func (gfd GFD) Validate() bool {
 }
 
 // NewGFD creates a new GFD.
+//
+// FIX L-5: elIndex, row and column are narrowed to the packed field widths
+// without a check — see the constants above for what that means and when it
+// matters. fd is carried as eight bytes and is not narrowed.
 func NewGFD(fd, elIndex, row, column int) (gfd GFD) {
 	gfd[0] = byte(elIndex)
 	gfd[1] = byte(row)

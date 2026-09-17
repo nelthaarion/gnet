@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -107,32 +108,60 @@ func (l *listener) open() (err error) {
 
 func (l *listener) close() {
 	l.closeOnce.Do(func() {
+		// A listener whose open() failed — an unsupported protocol, or an address
+		// already in use — has neither field set, and the old code fell through to
+		// l.ln.Close() on the nil interface, panicking while the engine was shutting
+		// down (the unix listener guards on its fd for the same reason).
 		if l.pc != nil {
 			logging.Error(os.NewSyscallError("close", l.pc.Close()))
+			l.pc = nil
 			return
 		}
-		l.pc = nil
-		logging.Error(os.NewSyscallError("close", l.ln.Close()))
+		if l.ln != nil {
+			logging.Error(os.NewSyscallError("close", l.ln.Close()))
+			l.ln = nil
+		}
 	})
 }
 
 func initListener(network, addr string, options *Options) (*listener, error) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				if network != "unix" && (options.ReuseAddr || options.ReusePort) {
-					_ = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_REUSEADDR, 1)
+			// Every setsockopt below used to be ignored, so a listener could come up
+			// with none of the requested socket options applied and no error to show
+			// for it — ReuseAddr silently not set, or a receive buffer of whatever
+			// the stack chose. Collect the first failure and fail the listen, which is
+			// what the unix path does by returning them from socket.TCPSocket.
+			var sockOptErr error
+			controlErr := c.Control(func(fd uintptr) {
+				h := windows.Handle(fd)
+				set := func(err error) {
+					if sockOptErr == nil {
+						sockOptErr = err
+					}
 				}
-				if options.TCPNoDelay == TCPNoDelay {
-					_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_TCP, windows.TCP_NODELAY, 1)
+				if network != "unix" && (options.ReuseAddr || options.ReusePort) {
+					set(windows.SetsockoptInt(h, windows.SOL_SOCKET, windows.SO_REUSEADDR, 1))
+				}
+				// TCP_NODELAY is only meaningful on a stream socket: on a UDP socket
+				// the call fails with WSAENOPROTOOPT. It used to be attempted anyway
+				// and the error swallowed, which was invisible until the errors above
+				// started being reported — at which point every UDP listener failed to
+				// start. The unix path guards this the same way.
+				if options.TCPNoDelay == TCPNoDelay && strings.HasPrefix(network, "tcp") {
+					set(windows.SetsockoptInt(h, windows.IPPROTO_TCP, windows.TCP_NODELAY, 1))
 				}
 				if options.SocketRecvBuffer > 0 {
-					_ = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_RCVBUF, options.SocketRecvBuffer)
+					set(windows.SetsockoptInt(h, windows.SOL_SOCKET, windows.SO_RCVBUF, options.SocketRecvBuffer))
 				}
 				if options.SocketSendBuffer > 0 {
-					_ = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_SNDBUF, options.SocketSendBuffer)
+					set(windows.SetsockoptInt(h, windows.SOL_SOCKET, windows.SO_SNDBUF, options.SocketSendBuffer))
 				}
 			})
+			if controlErr != nil {
+				return controlErr
+			}
+			return sockOptErr
 		},
 		KeepAlive: options.TCPKeepAlive,
 	}

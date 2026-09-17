@@ -352,7 +352,9 @@ func (rb *Buffer) ReadFrom(r io.Reader) (n int64, err error) {
 			if m < 0 {
 				panic("RingBuffer.ReadFrom: reader returned negative count from Read")
 			}
-			rb.isEmpty = false
+			if m > 0 {
+				rb.isEmpty = false
+			}
 			rb.w = (rb.w + m) % rb.size
 			n += int64(m)
 			if err == io.EOF {
@@ -378,7 +380,9 @@ func (rb *Buffer) ReadFrom(r io.Reader) (n int64, err error) {
 			if m < 0 {
 				panic("RingBuffer.ReadFrom: reader returned negative count from Read")
 			}
-			rb.isEmpty = false
+			if m > 0 {
+				rb.isEmpty = false
+			}
 			rb.w = (rb.w + m) % rb.size
 			n += int64(m)
 			if err == io.EOF {
@@ -506,6 +510,20 @@ func (rb *Buffer) grow(newCap int) {
 					newCap = n
 				}
 			}
+		}
+		// The loop above only grows while n < newCap, so it cannot make progress
+		// when the requested capacity does not exceed the current one.  WriteByte
+		// is exactly that caller: it needs a single extra byte and asks for grow(1),
+		// which used to leave newCap == rb.size.  The buffer was then resized to its
+		// current capacity with the write cursor sitting at rb.size, so the caller
+		// indexed rb.buf[rb.size] and panicked with "index out of range".
+		//
+		// Grow by a quarter instead — the same factor the loop uses — which keeps
+		// repeated WriteByte calls amortised O(1).  (rb.size >= bufferGrowThreshold
+		// here, since smaller buffers took the doubleCap branch above, so this
+		// always makes the buffer strictly larger.)
+		if newCap <= rb.size {
+			newCap = rb.size + rb.size/4
 		}
 	}
 	newBuf := bsPool.Get(newCap)

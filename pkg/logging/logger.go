@@ -186,9 +186,20 @@ func GetDefaultFlusher() Flusher {
 }
 
 // SetDefaultLoggerAndFlusher sets the default logger and its flusher.
+//
+// FIX L-8: a nil logger used to be stored verbatim. This is an exported function
+// that users are invited to call, so SetDefaultLoggerAndFlusher(nil, nil) was
+// reachable from ordinary application code — and it left every subsequent
+// package-level Debugf/Infof/Warnf/Errorf/Fatalf calling a method on a nil
+// interface, panicking the process on the next log line. A nil logger is now
+// rejected and the installed one is kept, so defaultLogger is never nil after
+// init(); the flusher is still updated, since clearing it is harmless.
 func SetDefaultLoggerAndFlusher(logger Logger, flusher Flusher) {
 	mu.Lock()
-	defaultLogger, defaultFlusher = logger, flusher
+	if logger != nil {
+		defaultLogger = logger
+	}
+	defaultFlusher = flusher
 	mu.Unlock()
 }
 

@@ -32,10 +32,20 @@ import (
 func (p *Poller) addWakeupEvent() error {
 	p.pipe = make([]int, 2)
 	if err := unix.Pipe2(p.pipe[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
-		logging.Fatalf("failed to create pipe for wakeup event: %v", err)
+		// FIX: this used to be logging.Fatalf, which exits the whole process from
+		// inside a library: an engine that cannot get two file descriptors took the
+		// host application down with it instead of failing Startup with an error.
+		// A failed pipe2 leaves the slice untouched, i.e. holding two zeroes, so
+		// drop it — otherwise Close would close file descriptor 0, the process's
+		// stdin.
+		p.pipe = nil
+		return err
 	}
 	_, err := unix.Kevent(p.fd, []unix.Kevent_t{{
-		Ident:  uint64(p.pipe[0]),
+		// FIX: Kevent_t.Ident is uint32 on the 32-bit BSDs and uint64 on the 64-bit
+		// ones, which is what the keventIdent alias exists for; a hard-coded
+		// uint64(...) here failed to compile for netbsd/386 and openbsd/386.
+		Ident:  keventIdent(p.pipe[0]),
 		Filter: unix.EVFILT_READ,
 		Flags:  unix.EV_ADD,
 	}}, nil, nil)
@@ -58,4 +68,18 @@ retry:
 func (p *Poller) drainWakeupEvent() {
 	var buf [8]byte
 	_, _ = unix.Read(p.pipe[0], buf[:])
+}
+
+// isWakeupEvent reports whether ev is the event raised by wakePoller.
+//
+// On these platforms the wakeup is a pipe registered under its own file
+// descriptor with the EVFILT_READ filter, so that descriptor is what identifies
+// the event.  Polling used to recognise the wakeup by "Ident == 0" instead — the
+// convention of the EVFILT_USER implementation used on the other BSDs — which
+// never matched a pipe descriptor (they are 3 or above), so the wakeup was never
+// drained: the queue never ran, wakeupCall was never cleared so only the first
+// wakeup was ever written, and since the pipe stayed readable the poller span at
+// 100% CPU in a non-blocking loop.
+func (p *Poller) isWakeupEvent(ev *unix.Kevent_t) bool {
+	return len(p.pipe) == 2 && ev.Filter == unix.EVFILT_READ && int(ev.Ident) == p.pipe[0]
 }

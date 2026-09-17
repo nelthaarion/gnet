@@ -239,7 +239,15 @@ func (el *eventloop) register0(c *conn) error {
 		c.release()
 		return err
 	}
-	el.connections.addConn(c, el.idx)
+	if err := el.connections.addConn(c, el.idx); err != nil {
+		// The matrix has no free slot left.  The poller registration above already
+		// succeeded, so deregister the fd before failing: otherwise the event-loop
+		// would keep receiving events for a connection it does not track.
+		_ = el.poller.Delete(c.fd)
+		_ = unix.Close(c.fd)
+		c.release()
+		return err
+	}
 	if c.isDatagram && c.remote != nil {
 		return nil
 	}

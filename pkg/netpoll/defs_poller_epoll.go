@@ -34,12 +34,30 @@ const (
 	// MaxAsyncTasksAtOneTime is the maximum amount of asynchronous tasks that the event-loop will process at one time.
 	MaxAsyncTasksAtOneTime = 256
 	// ReadEvents represents readable events that are polled by epoll.
+	//
+	// FIX L-12: EPOLLPRI is a priority (out-of-band) event. Nothing here enables
+	// SO_OOBINLINE or SO_SELECT_ERR_QUEUE, so the kernel does not put TCP urgent
+	// data on the error queue these sockets read from and no EPOLLPRI is ever
+	// generated for them; the bit is inert today. It is kept because it is what
+	// upstream requests, but the coupling is implicit: enabling either socket
+	// option later would start surfacing EPOLLPRI, and because IsReadEvent tests
+	// ReadEvents, a level-triggered EPOLLPRI that nothing consumes would re-arm
+	// every iteration — a read event that read(2) cannot clear. Remove the bit at
+	// the same time as adding such an option, not after.
 	ReadEvents = unix.EPOLLIN | unix.EPOLLPRI
 	// WriteEvents represents writeable events that are polled by epoll.
 	WriteEvents = unix.EPOLLOUT
 	// ReadWriteEvents represents both readable and writeable events.
 	ReadWriteEvents = ReadEvents | WriteEvents
 	// ErrEvents represents exceptional events that occurred.
+	//
+	// FIX L-12: EPOLLRDHUP is deliberately absent. It is requested in edge-triggered
+	// mode (see AddRead/ModReadWrite), and on a peer half-close the kernel reports it
+	// together with EPOLLIN — because tcp_poll sets both when the receive side is
+	// shut down. Adding it here would therefore classify an ordinary orderly
+	// shutdown as an error event and tear the connection down before the data the
+	// peer sent before closing was read. The read path already turns that same
+	// condition into io.EOF when read(2) returns 0, which is where the close belongs.
 	ErrEvents = unix.EPOLLERR | unix.EPOLLHUP
 )
 

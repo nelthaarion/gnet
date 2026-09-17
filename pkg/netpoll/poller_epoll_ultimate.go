@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -32,6 +33,8 @@ import (
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	// Polling must return before Close; concurrent Trigger calls are synchronized.
+	lifecycle sync.RWMutex
 	fd                          int             // epoll fd
 	epa                         *PollAttachment // PollAttachment for waking events
 	efdBuf                      []byte          // efd buffer to read an 8-byte integer
@@ -51,7 +54,11 @@ func OpenPoller() (poller *Poller, err error) {
 	}
 	var efd int
 	if efd, err = unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC); err != nil {
-		_ = poller.Close()
+		// FIX H-2/M-8: this used to call poller.Close(), which dereferences
+		// poller.epa — still nil here, since it is assigned below — and panicked
+		// instead of returning the eventfd error.  Only the epoll descriptor
+		// exists yet, so close just that one.
+		_ = unix.Close(poller.fd)
 		poller = nil
 		err = os.NewSyscallError("eventfd", err)
 		return
@@ -70,9 +77,24 @@ func OpenPoller() (poller *Poller, err error) {
 }
 
 // Close closes the poller.
+//
+// Close is idempotent, and tolerates the partially initialised poller that
+// OpenPoller hands to it when a step of the setup fails: epa is nil until the
+// eventfd has been created, and fd/efa carry -1 once the poller is closed.
 func (p *Poller) Close() error {
-	_ = unix.Close(p.epa.FD)
-	return os.NewSyscallError("close", unix.Close(p.fd))
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
+	// FIX M-11: the -1 sentinel doubles as the "closed" flag that Trigger checks.
+	if p.fd < 0 {
+		return nil
+	}
+	if p.epa != nil {
+		_ = unix.Close(p.epa.FD)
+		p.epa = nil
+	}
+	err := os.NewSyscallError("close", unix.Close(p.fd))
+	p.fd = -1
+	return err
 }
 
 // Make the endianness of bytes compatible with more linux OSs under different processor-architectures,
@@ -89,6 +111,15 @@ var (
 //
 // Note that asyncTaskQueue is a queue of low-priority whose size may grow large and tasks in it may backlog.
 func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any) (err error) {
+	p.lifecycle.RLock()
+	defer p.lifecycle.RUnlock()
+	// FIX M-11: after Close the descriptors are -1 and their numbers may already
+	// belong to unrelated files opened by the process.  Refuse the task up front —
+	// before taking one out of the task pool, which would otherwise never be
+	// returned to it.
+	if p.fd < 0 {
+		return errorx.ErrPollerClosed
+	}
 	task := queue.GetTask()
 	task.Exec, task.Param = fn, param
 	if priority > queue.HighPriority && p.urgentAsyncTaskQueue.Length() >= p.highPriorityEventsThreshold {
@@ -149,6 +180,12 @@ func (p *Poller) Polling() error {
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					// FIX L-11: this task is as much a pooled object as any other and
+					// used to be dropped on the way out — one leaked *Task per poller
+					// shutdown. The tasks still queued are returned unexecuted for the
+					// same reason: Polling is over, so nothing will ever dequeue them.
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)
@@ -159,6 +196,8 @@ func (p *Poller) Polling() error {
 				}
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)

@@ -23,6 +23,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -35,6 +36,9 @@ import (
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	// lifecycle protects task admission and wakeup descriptors against Close.
+	// Polling must have returned before Close, as required by the engine lifecycle.
+	lifecycle sync.RWMutex
 	fd                          int    // epoll fd
 	efd                         int    // eventfd
 	efdBuf                      []byte // efd buffer to read an 8-byte integer
@@ -53,7 +57,10 @@ func OpenPoller() (poller *Poller, err error) {
 		return
 	}
 	if poller.efd, err = unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC); err != nil {
-		_ = poller.Close()
+		// FIX M-8: this used to call poller.Close(), which closes efd — still zero
+		// at this point, so the poller closed file descriptor 0, i.e. stdin of the
+		// hosting process.  Only the epoll descriptor exists yet, close that one.
+		_ = unix.Close(poller.fd)
 		poller = nil
 		err = os.NewSyscallError("eventfd", err)
 		return
@@ -71,9 +78,25 @@ func OpenPoller() (poller *Poller, err error) {
 }
 
 // Close closes the poller.
+//
+// Close is idempotent: it marks the poller as closed by setting both descriptors
+// to -1, so closing twice is a no-op instead of a second close(2) on a descriptor
+// number the runtime may have handed out again in the meantime.
 func (p *Poller) Close() error {
-	_ = unix.Close(p.efd)
-	return os.NewSyscallError("close", unix.Close(p.fd))
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
+	// FIX M-11: the -1 sentinel doubles as the "closed" flag that Trigger checks.
+	if p.fd < 0 {
+		return nil
+	}
+	// efd is only valid once OpenPoller got past unix.Eventfd; a bare Poller has
+	// it at 0, which is stdin, so guard it the same way.
+	if p.efd > 0 {
+		_ = unix.Close(p.efd)
+	}
+	err := os.NewSyscallError("close", unix.Close(p.fd))
+	p.fd, p.efd = -1, -1
+	return err
 }
 
 // Make the endianness of bytes compatible with more linux OSs under different processor-architectures,
@@ -85,6 +108,17 @@ var (
 
 // Trigger enqueues task and wakes up the poller to process pending tasks.
 func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any) (err error) {
+	p.lifecycle.RLock()
+	defer p.lifecycle.RUnlock()
+	// FIX M-11: after Close the descriptors are -1 and, more importantly, their
+	// numbers may already belong to unrelated files opened by the process.  Writing
+	// to them would either fail or, worse, wake something that is not this poller,
+	// so refuse the task up front — before taking one out of the task pool, which
+	// would otherwise never be returned to it. The read lock protects both this
+	// check and the subsequent wakeup syscall against descriptor closure.
+	if p.fd < 0 {
+		return errorx.ErrPollerClosed
+	}
 	task := queue.GetTask()
 	task.Exec, task.Param = fn, param
 	if priority > queue.HighPriority && p.urgentAsyncTaskQueue.Length() >= p.highPriorityEventsThreshold {
@@ -125,10 +159,10 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
-			// FIX S-1: ev.Fd is int32 (the EpollEvent struct field is int32 on Linux).
-			// We store the fd in Fd only when it fits in int32 (see epollAdd below).
-			// On the read path, convert back via int(ev.Fd) which sign-extends on
-			// 64-bit; since we only store valid non-negative fds, this is safe.
+			// FIX L-1: ev.Fd is int32 — that is the width of the epoll_event struct
+			// field on Linux. epollAdd (below) only ever installs a non-negative fd
+			// that fits in int32, so int(ev.Fd) reproduces the registered fd exactly
+			// and the comparison against the poller's own eventfd is meaningful.
 			if fd := int(ev.Fd); fd == p.efd { // poller is awakened to run tasks in queues.
 				doChores = true
 			} else {
@@ -145,6 +179,12 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					// FIX L-11: this task is as much a pooled object as any other and
+					// used to be dropped on the way out — one leaked *Task per poller
+					// shutdown. The tasks still queued are returned unexecuted for the
+					// same reason: Polling is over, so nothing will ever dequeue them.
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)
@@ -155,6 +195,8 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 				}
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)
@@ -183,28 +225,29 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 	}
 }
 
-// epollAdd is the single helper that calls unix.EpollCtl(ADD/MOD) with a
-// safe int32 fd check.
+// epollAdd is the single helper that calls unix.EpollCtl(ADD/MOD) with an
+// explicit range check on the fd.
 //
-// FIX S-1: The Linux epoll_event struct stores Fd as int32. On amd64 (and all
-// 64-bit Linux platforms), file descriptors are non-negative ints that can in
-// theory reach up to /proc/sys/fs/nr_open (default 1048576) or even higher
-// with custom kernel configuration. In practice the kernel enforces a per-process
-// limit well below MaxInt32, but we add an explicit guard to make the truncation
-// visible and turn it into an error instead of silent misbehaviour.
+// FIX L-1: this guard used to test only `pa.FD > math.MaxInt32`. That left the
+// negative half unguarded, so a bogus fd such as -1 was written to the kernel as
+// int32(-1) and, more importantly, round-tripped back on the read path as a
+// negative int that can never equal a real fd — the event would then be routed to
+// callback() for a connection the matrix does not hold. Both bounds are checked
+// now, and the comparison is written as int64 so it means the same thing on every
+// word size: as written before, on a 32-bit GOARCH `pa.FD > math.MaxInt32` was
+// `int > MaxInt`, a constant-false expression the compiler cannot warn about
+// because the constant is what makes it false.
 //
-// If pa.FD exceeds math.MaxInt32, we return an error pointing the operator to
-// the poll_opt build tag, whose implementation uses a uintptr pointer in the
-// epoll_data union instead of the Fd field, avoiding the int32 constraint.
+// Note what this is and is not. It is a cheap consistency check on a value that
+// gnet itself produced from accept(2)/socket(2); it is not a security boundary,
+// and it is not the reason fds above 2^30 work — the kernel's own per-process fd
+// limit (fs.nr_open, 2^20 by default) is what keeps the int32 epoll_data field
+// from truncating in practice. The poll_opt build does not need the check at all
+// because it stores a pointer in the epoll_data union instead of the fd.
 func epollAdd(epfd int, op int, pa *PollAttachment, ev uint32) error {
-	if pa.FD > math.MaxInt32 {
-		// This should never happen on Linux with default kernel settings, but
-		// if it does (e.g. after tens of millions of connections on a long-running
-		// server with fd recycling disabled), the truncation would cause the wrong
-		// connection to be woken up or the poller's eventfd to be falsely matched.
-		// Fail loudly rather than silently corrupt I/O routing.
-		return fmt.Errorf("epoll_ctl: fd %d exceeds int32 range; "+
-			"rebuild with the 'poll_opt' build tag to use pointer-based epoll_data", pa.FD)
+	if pa.FD < 0 || int64(pa.FD) > math.MaxInt32 {
+		return fmt.Errorf("epoll_ctl: fd %d is out of the int32 range that the "+
+			"epoll_event struct can carry", pa.FD)
 	}
 	return os.NewSyscallError("epoll_ctl",
 		unix.EpollCtl(epfd, op, pa.FD, &unix.EpollEvent{

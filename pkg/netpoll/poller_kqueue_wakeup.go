@@ -52,3 +52,14 @@ retry:
 }
 
 func (p *Poller) drainWakeupEvent() {}
+
+// isWakeupEvent reports whether ev is the event raised by wakePoller.
+//
+// The wakeup is registered as Ident 0 with the EVFILT_USER filter, while a
+// connection is registered with EVFILT_READ/EVFILT_WRITE.  The filter has to be
+// part of the test: matching on the identifier alone made a connection that
+// happened to own file descriptor 0 look like a wakeup, so its events were
+// swallowed and its callback never ran.
+func (p *Poller) isWakeupEvent(ev *unix.Kevent_t) bool {
+	return ev.Ident == 0 && ev.Filter == unix.EVFILT_USER
+}

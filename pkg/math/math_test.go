@@ -72,15 +72,16 @@ func TestCeilToPowerOfTwo(t *testing.T) {
 		{name: "very_large_1M", args: args{n: 1 << 20}, want: 1 << 20},
 		{name: "very_large_1M_plus_1", args: args{n: 1<<20 + 1}, want: 1 << 21},
 
-		// Huge value tests: around 2^30 (32-bit system)
+		// Huge value tests: around 2^30 (the largest input a 32-bit int can hold).
+		//
+		// FIX L-6: the cases above 2^30 used to live here too, and their expected
+		// values (1<<31, 1<<32, 1<<33) are untyped constants that do not fit in a
+		// 32-bit int, so this file did not compile with GOARCH=386 (or arm, mips,
+		// wasm). They now live in math_64bit_test.go, and the 32-bit counterpart in
+		// math_32bit_test.go pins down what CeilToPowerOfTwo does at the boundary
+		// that only exists there. Nothing in this table exceeds math.MaxInt32.
 		{name: "huge_1G_minus_1", args: args{n: 1<<30 - 1}, want: 1 << 30},
 		{name: "huge_1G", args: args{n: 1 << 30}, want: 1 << 30},
-		{name: "huge_1G_plus_1", args: args{n: 1<<30 + 1}, want: 1 << 31},
-
-		// 64-bit system tests: around 2^32
-		{name: "extreme_2_32_minus_1", args: args{n: 1<<32 - 1}, want: 1 << 32},
-		{name: "extreme_2_32", args: args{n: 1 << 32}, want: 1 << 32},
-		{name: "extreme_2_32_plus_1", args: args{n: 1<<32 + 1}, want: 1 << 33},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

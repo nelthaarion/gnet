@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -31,6 +32,8 @@ import (
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	// Polling must return before Close; concurrent Trigger calls are synchronized.
+	lifecycle sync.RWMutex
 	fd                          int
 	pipe                        []int
 	wakeupCall                  int32
@@ -60,12 +63,24 @@ func OpenPoller() (poller *Poller, err error) {
 }
 
 // Close closes the poller.
+//
+// Close is idempotent: it records that the poller is closed by setting fd to -1,
+// so a second close cannot hit a descriptor number the runtime has since handed
+// out again.
 func (p *Poller) Close() error {
-	if len(p.pipe) == 2 {
-		_ = unix.Close(p.pipe[0])
-		_ = unix.Close(p.pipe[1])
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
+	// FIX M-11: the -1 sentinel doubles as the "closed" flag that Trigger checks.
+	if p.fd < 0 {
+		return nil
 	}
-	return os.NewSyscallError("close", unix.Close(p.fd))
+	for _, fd := range p.pipe {
+		_ = unix.Close(fd)
+	}
+	p.pipe = nil
+	err := os.NewSyscallError("close", unix.Close(p.fd))
+	p.fd = -1
+	return err
 }
 
 // Trigger enqueues task and wakes up the poller to process pending tasks.
@@ -75,6 +90,15 @@ func (p *Poller) Close() error {
 //
 // Note that asyncTaskQueue is a queue of low-priority whose size may grow large and tasks in it may backlog.
 func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any) (err error) {
+	p.lifecycle.RLock()
+	defer p.lifecycle.RUnlock()
+	// FIX M-11: after Close the descriptors are -1 and their numbers may already
+	// belong to unrelated files opened by the process.  Refuse the task up front —
+	// before taking one out of the task pool, which would otherwise never be
+	// returned to it.
+	if p.fd < 0 {
+		return errorx.ErrPollerClosed
+	}
 	task := queue.GetTask()
 	task.Exec, task.Param = fn, param
 	if priority > queue.HighPriority && p.urgentAsyncTaskQueue.Length() >= p.highPriorityEventsThreshold {
@@ -114,11 +138,11 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
-			if fd := int(ev.Ident); fd == 0 { // poller is awakened to run tasks in queues
+			if p.isWakeupEvent(ev) { // poller is awakened to run tasks in queues
 				doChores = true
 				p.drainWakeupEvent()
 			} else {
-				err = callback(fd, ev.Filter, ev.Flags)
+				err = callback(int(ev.Ident), ev.Filter, ev.Flags)
 				if errors.Is(err, errorx.ErrAcceptSocket) || errors.Is(err, errorx.ErrEngineShutdown) {
 					return err
 				}
@@ -131,6 +155,12 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					// FIX L-11: this task is as much a pooled object as any other and
+					// used to be dropped on the way out — one leaked *Task per poller
+					// shutdown. The tasks still queued are returned unexecuted for the
+					// same reason: Polling is over, so nothing will ever dequeue them.
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)
@@ -141,6 +171,8 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 				}
 				err = task.Exec(task.Param)
 				if errors.Is(err, errorx.ErrEngineShutdown) {
+					queue.PutTask(task)
+					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
 				}
 				queue.PutTask(task)

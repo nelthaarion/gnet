@@ -322,7 +322,18 @@ func createListeners(addrs []string, opts ...Option) ([]*listener, *Options, err
 	logger, logFlusher := logging.GetDefaultLogger(), logging.GetDefaultFlusher()
 	if options.Logger == nil {
 		if options.LogPath != "" {
-			logger, logFlusher, _ = logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			// FIX L-8: the error used to be discarded into _. CreateLoggerAsLocalFile
+			// returns (nil, nil, err) for an empty path and can also fail on the file
+			// itself; installing that nil logger then made every subsequent logging
+			// call panic on the nil receiver. Keep the logger already in place (the
+			// package default, or the one from GNET_LOGGING_FILE/WithLogger) and say so.
+			fileLogger, fileFlusher, logErr := logging.CreateLoggerAsLocalFile(options.LogPath, options.LogLevel)
+			if logErr != nil {
+				logging.Errorf("failed to create a logger on %s, keeping the current logger: %v",
+					options.LogPath, logErr)
+			} else {
+				logger, logFlusher = fileLogger, fileFlusher
+			}
 		}
 		options.Logger = logger
 	} else {
@@ -391,17 +402,27 @@ func createListeners(addrs []string, opts ...Option) ([]*listener, *Options, err
 		options.EdgeTriggeredIO = false
 	}
 
-	listeners := make([]*listener, len(addrs))
-	for i, a := range addrs {
+	listeners := make([]*listener, 0, len(addrs))
+	// FIX L-3: a listener that fails to initialise used to leak the sockets of
+	// every listener created before it — the caller only receives a nil slice on
+	// error, so nothing is left to close them with.
+	closeListeners := func() {
+		for _, ln := range listeners {
+			ln.close()
+		}
+	}
+	for _, a := range addrs {
 		proto, addr, err := parseProtoAddr(a)
 		if err != nil {
+			closeListeners()
 			return nil, nil, err
 		}
 		ln, err := initListener(proto, addr, options)
 		if err != nil {
+			closeListeners()
 			return nil, nil, err
 		}
-		listeners[i] = ln
+		listeners = append(listeners, ln)
 	}
 
 	return listeners, options, nil
@@ -463,9 +484,12 @@ var (
 //     poll loop below handle the correct terminal state.
 //
 // FIX S-4: If two goroutines call gnet.Run with the same address concurrently,
-// the second Store overwrites the first entry in allEngines without shutting down
-// the first engine — causing a goroutine and fd leak. We now use LoadOrStore to
-// detect this condition and log a warning, guiding users toward Engine.Stop.
+// a plain Store would overwrite the first entry in allEngines without shutting
+// the first engine down — causing a goroutine and fd leak, and leaving an engine
+// that gnet.Stop can no longer reach. run() now detects the clash with LoadOrStore
+// before it overwrites, and warns. The previous version of this comment described
+// that fix while the code still did an unconditional Store (see engine_unix.go and
+// engine_windows.go, where the FIX S-4 handling actually lives).
 func Stop(ctx context.Context, protoAddr string) error {
 	s, ok := allEngines.Load(protoAddr)
 	if !ok {

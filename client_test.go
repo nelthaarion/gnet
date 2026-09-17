@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
@@ -706,9 +707,16 @@ func TestClientReadOnEOF(t *testing.T) {
 		logging.SetDefaultLoggerAndFlusher(currentLogger, currentFlusher) // restore
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:9999")
-	assert.NoError(t, err)
+	// FIX: this test hardcoded port 9999 and asserted the listen with assert (not
+	// require), so on a machine where that port is taken — another process holding
+	// it, or a Windows excluded port range — the assertion was recorded and the test
+	// then dereferenced the nil listener and panicked, hiding the real error. Ask the
+	// kernel for a free port instead and stop at the first failed precondition.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
 	defer ln.Close() //nolint:errcheck
+
+	addr := ln.Addr().String()
 
 	err = goPool.DefaultWorkerPool.Submit(func() {
 		for {
@@ -722,7 +730,7 @@ func TestClientReadOnEOF(t *testing.T) {
 			assert.NoError(t, err)
 		}
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ev := &clientReadOnEOF{
 		result: make(chan struct {
@@ -738,14 +746,14 @@ func TestClientReadOnEOF(t *testing.T) {
 		WithLogger(zap.NewExample().Sugar()),
 		WithReadBufferCap(32*1024),
 		WithWriteBufferCap(32*1024))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	defer cli.Stop() //nolint:errcheck
 
 	err = cli.Start()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	_, err = cli.Dial("tcp", "127.0.0.1:9999")
-	assert.NoError(t, err)
+	_, err = cli.Dial("tcp", addr)
+	require.NoError(t, err)
 
 	select {
 	case res := <-ev.result:

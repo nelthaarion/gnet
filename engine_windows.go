@@ -42,7 +42,7 @@ type engine struct {
 }
 
 func (eng *engine) isShutdown() bool {
-	return eng.inShutdown.Load()
+	return eng.inShutdown.Load() || eng.beingShutdown.Load()
 }
 
 // shutdown signals the engine to shut down.
@@ -50,15 +50,12 @@ func (eng *engine) shutdown(err error) {
 	if err != nil && !errors.Is(err, errorx.ErrEngineShutdown) {
 		eng.opts.Logger.Errorf("engine is being shutdown with error: %v", err)
 	}
-	eng.turnOff()
 	eng.beingShutdown.Store(true)
+	eng.turnOff()
 }
 
 func (eng *engine) closeEventLoops() {
-	eng.eventLoops.iterate(func(i int, el *eventloop) bool {
-		el.ch <- errorx.ErrEngineShutdown
-		return true
-	})
+	eng.shutdown(nil)
 	for _, ln := range eng.listeners {
 		ln.close()
 	}
@@ -138,8 +135,11 @@ func run(eventHandler EventHandler, listeners []*listener, options *Options, add
 	switch options.LB {
 	case RoundRobin:
 		eng.eventLoops = new(roundRobinLoadBalancer)
-		// If there are more than one listener, we can't use roundRobinLoadBalancer because
-		// it's not concurrency-safe, replace it with leastConnectionsLoadBalancer.
+		// With more than one listener, keep least-connections instead of round-robin:
+		// round-robin is now concurrency-safe (nextIndex is atomic, see FIX P-1 in
+		// load_balancer.go), but its counter is shared by all acceptors, so each
+		// listener would hand out a different loop for the same position and a busy
+		// listener could pile connections onto a loop that is already behind.
 		if len(listeners) > 1 {
 			eng.eventLoops = new(leastConnectionsLoadBalancer)
 		}
@@ -163,7 +163,15 @@ func run(eventHandler EventHandler, listeners []*listener, options *Options, add
 	defer eng.stop(rootCtx, engine)
 
 	for _, addr := range addrs {
-		allEngines.Store(addr, &eng)
+		// FIX S-4: see the same change in engine_unix.go — an unconditional Store
+		// hid the fact that an engine already registered on this address had just
+		// become unreachable to gnet.Stop, and therefore leaked.
+		if prev, loaded := allEngines.LoadOrStore(addr, &eng); loaded {
+			eng.opts.Logger.Warnf("gnet: an engine is already registered on %s (%p); "+
+				"it is replaced in the registry and can no longer be stopped with gnet.Stop, "+
+				"use Engine.Stop or a distinct address", addr, prev)
+			allEngines.Store(addr, &eng)
+		}
 	}
 
 	return nil
