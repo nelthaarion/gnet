@@ -1,0 +1,6 @@
+**/.git
+**/.github
+**/.kilo
+**/*_test.go
+current/bench/baseline
+baseline/bench/baseline

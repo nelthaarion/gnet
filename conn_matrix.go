@@ -34,6 +34,11 @@ type connMatrix struct {
 	table          [gfd.ConnMatrixRowMax][]*conn
 	fd2gfd         map[int]gfd.GFD
 	dirty          bool
+	// seq is this matrix's own gfd duplicate-detection counter. Using one
+	// per matrix instead of the package-global counter removes a cache line
+	// shared by every event-loop from the accept path.
+	seq    uint32
+	total  int32 // live connection count, so loadCount is O(1) not O(256)
 }
 
 func (cm *connMatrix) init() {
@@ -60,13 +65,15 @@ func (cm *connMatrix) iterate(f func(*conn) bool) {
 
 func (cm *connMatrix) incCount(row int, delta int32) {
 	atomic.AddInt32(&cm.connCounts[row], delta)
+	atomic.AddInt32(&cm.total, delta)
 }
 
 func (cm *connMatrix) loadCount() (n int32) {
-	for i := range cm.connCounts {
-		n += atomic.LoadInt32(&cm.connCounts[i])
-	}
-	return
+	// O(1): the per-row counters kept this an O(256) atomic scan on every
+	// call, and least-connections load balancing calls it per accepted
+	// connection, which made that balancer cost 256 cache-line touches per
+	// connection on a 256-row matrix.
+	return atomic.LoadInt32(&cm.total)
 }
 
 func (cm *connMatrix) addConn(c *conn, index int) error {
@@ -76,7 +83,7 @@ func (cm *connMatrix) addConn(c *conn, index int) error {
 	if cm.table[cm.tailRow] == nil {
 		cm.table[cm.tailRow] = make([]*conn, gfd.ConnMatrixColumnMax)
 	}
-	c.gfd = gfd.NewGFD(c.fd, index, cm.tailRow, cm.tailCol)
+	c.gfd = gfd.NewGFDWithSeq(c.fd, index, cm.tailRow, cm.tailCol, &cm.seq)
 	cm.fd2gfd[c.fd] = c.gfd
 	cm.table[cm.tailRow][cm.tailCol] = c
 	cm.incCount(cm.tailRow, 1)

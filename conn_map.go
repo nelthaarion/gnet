@@ -25,6 +25,9 @@ import (
 type connMatrix struct {
 	connCount int32
 	connMap   map[int]*conn
+	// seq is this matrix's own gfd duplicate-detection counter; see
+	// conn_matrix.go for why it is per-matrix and not package-global.
+	seq uint32
 }
 
 func (cm *connMatrix) init() {
@@ -52,7 +55,7 @@ func (cm *connMatrix) loadCount() (n int32) {
 // addConn registers c in the map.  Unlike the matrix-backed implementation this
 // one grows on demand, so it never runs out of room and never fails.
 func (cm *connMatrix) addConn(c *conn, index int) error {
-	c.gfd = gfd.NewGFD(c.fd, index, 0, 0)
+	c.gfd = gfd.NewGFDWithSeq(c.fd, index, 0, 0, &cm.seq)
 	cm.connMap[c.fd] = c
 	cm.incCount(0, 1)
 	return nil

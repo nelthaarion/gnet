@@ -47,6 +47,9 @@ type eventloop struct {
 	buffer       []byte            // read packet buffer whose capacity is set by user, default value is 64KB
 	connections  connMatrix        // loop connections storage
 	eventHandler EventHandler      // user eventHandler
+	// gfdSeq feeds the gfd of UDP connections, which this loop creates once
+	// per datagram; a per-loop counter keeps the global one off that path.
+	gfdSeq uint32
 }
 
 func (el *eventloop) Register(ctx context.Context, addr net.Addr) (<-chan RegisteredResult, error) {
@@ -346,7 +349,14 @@ func (el *eventloop) write(c *conn) error {
 	)
 loop:
 	iov, _ := c.outboundBuffer.Peek(-1)
-	if len(iov) > 1 {
+	// Fast path: Peek always reports the ring-buffer as two slices (head, tail)
+	// even when the data is a single contiguous run, so a plain write(2) is the
+	// right call whenever the tail is empty. The old code took the writev branch
+	// unconditionally in that case, paying an extra iovec and a heavier syscall
+	// per flush on the overwhelmingly common single-segment buffer.
+	if len(iov) == 2 && len(iov[1]) == 0 {
+		n, err = unix.Write(c.fd, iov[0])
+	} else if len(iov) > 1 {
 		if len(iov) > iovMax {
 			iov = iov[:iovMax]
 		}

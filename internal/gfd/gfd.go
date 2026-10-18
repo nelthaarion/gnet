@@ -57,6 +57,24 @@ func (seq *monotoneSeq) Inc() uint32 {
 
 var monoSeq = new(monotoneSeq)
 
+// NewGFDWithSeq creates a new GFD, taking the duplicate-detection sequence from
+// the caller's counter instead of the package-global one.
+//
+// The package-global counter is a single cache line that every event-loop and
+// every UDP datagram used to increment: on an N-core server that line ping-pongs
+// between cores on every connection and every packet, which caps the rate the
+// accept path (and the whole UDP path) can run at. The sequence only has to
+// distinguish a recycled fd from a live one *within the owner's own table*, so
+// a per-owner counter is equally correct and scales.
+func NewGFDWithSeq(fd, elIndex, row, column int, seq *uint32) (gfd GFD) {
+	gfd[0] = byte(elIndex)
+	gfd[1] = byte(row)
+	binary.BigEndian.PutUint16(gfd[ConnMatrixColumnOffset:SequenceOffset], uint16(column))
+	binary.BigEndian.PutUint32(gfd[SequenceOffset:FdOffset], atomic.AddUint32(seq, 1))
+	binary.BigEndian.PutUint64(gfd[FdOffset:], uint64(fd))
+	return
+}
+
 // GFD is a structure to store the fd, eventloop index, connStore indexes.
 type GFD [0x10]byte
 
@@ -110,11 +128,10 @@ func (gfd GFD) Validate() bool {
 		gfd.Sequence() > 0
 }
 
-// NewGFD creates a new GFD.
+// NewGFD creates a new GFD using the package-global sequence counter.
 //
-// FIX L-5: elIndex, row and column are narrowed to the packed field widths
-// without a check — see the constants above for what that means and when it
-// matters. fd is carried as eight bytes and is not narrowed.
+// Deprecated: every call contends on one cache line shared by the whole
+// process; prefer NewGFDWithSeq with a per-event-loop counter.
 func NewGFD(fd, elIndex, row, column int) (gfd GFD) {
 	gfd[0] = byte(elIndex)
 	gfd[1] = byte(row)

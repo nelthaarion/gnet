@@ -75,7 +75,7 @@ func newUDPConn(fd int, el *eventloop, localAddr net.Addr, sa unix.Sockaddr, con
 	c = &conn{
 		fd:             fd,
 		proto:          "udp",
-		gfd:            gfd.NewGFD(fd, el.idx, 0, 0),
+		gfd:            gfd.NewGFDWithSeq(fd, el.idx, 0, 0, &el.gfdSeq),
 		remote:         sa,
 		loop:           el,
 		localAddr:      localAddr,
@@ -160,11 +160,10 @@ func (c *conn) write(data []byte) (n int, err error) {
 		return
 	}
 
-	defer func() {
-		if err != nil {
-			_ = c.loop.close(c, os.NewSyscallError("write", err))
-		}
-	}()
+	// The old body opened this function with a `defer func(){ if err != nil {
+	// c.loop.close(...) } }()`. The closure made the write path non-inlinable
+	// and forced the error case through an indirection; the error paths below
+	// now close the connection inline, so the fast path is closure-free.
 
 	var sent int
 loop:
@@ -176,8 +175,17 @@ loop:
 			if !isET {
 				err = c.loop.poller.ModReadWrite(&c.pollAttachment, isET)
 			}
+			if err != nil {
+				// The deferred handler would have done this; the point of
+				// inlining it is to keep the closure off the hot path, so the
+				// error path has to do its own cleanup.
+				_ = c.loop.close(c, os.NewSyscallError("write", err))
+			}
 			return
 		}
+		// Not a temporary error: the connection is gone, exactly as the old
+		// deferred handler would have reported it.
+		_ = c.loop.close(c, os.NewSyscallError("write", err))
 		return 0, err
 	}
 	data = data[sent:]
