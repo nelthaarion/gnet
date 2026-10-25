@@ -240,7 +240,7 @@ func (el *eventloop) run() (err error) {
 		case *openConn:
 			err = el.open(v)
 		case *tcpConn:
-			err = el.read(unpackTCPConn(v))
+			err = el.readTCP(v)
 		case *udpConn:
 			err = el.readUDP(v.c)
 		case func() error:
@@ -276,6 +276,16 @@ func (el *eventloop) open(oc *openConn) (err error) {
 	}
 
 	return el.handleAction(c, action)
+}
+
+// readTCP is the event-loop side of one inbound stream arrival: hand the packed
+// buffer to the connection it belongs to and run the handler. It is a separate
+// function so the buffer ownership transfer lives in exactly one place, next to
+// the loop that calls it, and so the wrapper that carried the arrival can be
+// recycled as soon as the loop is done with it.
+func (el *eventloop) readTCP(tc *tcpConn) error {
+	defer tcpConnPool.Put(tc)
+	return el.read(unpackTCPConn(tc))
 }
 
 func (el *eventloop) read(c *conn) error {

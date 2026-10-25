@@ -33,6 +33,8 @@ import (
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	pollYield // scheduler-yield policy, see SetYield
+
 	// Polling must return before Close; concurrent Trigger calls are synchronized.
 	lifecycle sync.RWMutex
 	fd                          int
@@ -124,18 +126,25 @@ func (p *Poller) Polling() error {
 		ts       unix.Timespec
 		tsp      *unix.Timespec
 		doChores bool
+		// See pollYield: with the yield off the loop never polls without blocking
+		// and never calls Gosched; it goes straight back to the blocking wait.
+		yield = !p.noYield
 	)
 	for {
 		n, err := unix.Kevent(p.fd, nil, el.events, tsp)
 		if n == 0 || (n < 0 && err == unix.EINTR) {
 			tsp = nil
-			runtime.Gosched()
+			if yield {
+				runtime.Gosched()
+			}
 			continue
 		} else if err != nil {
 			logging.Errorf("error occurs in kqueue: %v", os.NewSyscallError("kevent wait", err))
 			return err
 		}
-		tsp = &ts
+		if yield {
+			tsp = &ts
+		}
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
@@ -145,7 +154,7 @@ func (p *Poller) Polling() error {
 			} else {
 				pollAttachment := restorePollAttachment(unsafe.Pointer(&ev.Udata))
 				err = pollAttachment.Callback(int(ev.Ident), ev.Filter, ev.Flags)
-				if errors.Is(err, errorx.ErrAcceptSocket) || errors.Is(err, errorx.ErrEngineShutdown) {
+				if err != nil && (errors.Is(err, errorx.ErrAcceptSocket) || errors.Is(err, errorx.ErrEngineShutdown)) {
 					return err
 				}
 			}
@@ -156,7 +165,7 @@ func (p *Poller) Polling() error {
 			task := p.urgentAsyncTaskQueue.Dequeue()
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)
-				if errors.Is(err, errorx.ErrEngineShutdown) {
+				if err != nil && errors.Is(err, errorx.ErrEngineShutdown) {
 					// FIX L-11: this task is as much a pooled object as any other and
 					// used to be dropped on the way out — one leaked *Task per poller
 					// shutdown. The tasks still queued are returned unexecuted for the
@@ -172,7 +181,7 @@ func (p *Poller) Polling() error {
 					break
 				}
 				err = task.Exec(task.Param)
-				if errors.Is(err, errorx.ErrEngineShutdown) {
+				if err != nil && errors.Is(err, errorx.ErrEngineShutdown) {
 					queue.PutTask(task)
 					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
@@ -187,11 +196,7 @@ func (p *Poller) Polling() error {
 			}
 		}
 
-		if n == el.size {
-			el.expand()
-		} else if n < el.size>>1 {
-			el.shrink()
-		}
+		el.adapt(n)
 	}
 }
 

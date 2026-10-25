@@ -29,6 +29,7 @@ func (el *eventloop) rotate() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling()
 	if errors.Is(err, errorx.ErrEngineShutdown) {
 		el.getLogger().Debugf("main reactor is exiting in terms of the demand from user, %v", err)
@@ -48,6 +49,7 @@ func (el *eventloop) orbit() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling()
 	if errors.Is(err, errorx.ErrEngineShutdown) {
 		el.getLogger().Debugf("event-loop(%d) is exiting in terms of the demand from user, %v", el.idx, err)
@@ -68,6 +70,7 @@ func (el *eventloop) run() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling()
 	if errors.Is(err, errorx.ErrEngineShutdown) {
 		el.getLogger().Debugf("event-loop(%d) is exiting in terms of the demand from user, %v", el.idx, err)

@@ -30,6 +30,7 @@ func (el *eventloop) rotate() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling(el.accept0)
 	if errors.Is(err, errorx.ErrEngineShutdown) {
 		el.getLogger().Debugf("main reactor is exiting in terms of the demand from user, %v", err)
@@ -49,6 +50,7 @@ func (el *eventloop) orbit() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling(func(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
 		c := el.connections.getConn(fd)
 		if c == nil {
@@ -82,6 +84,7 @@ func (el *eventloop) run() error {
 		defer runtime.UnlockOSThread()
 	}
 
+	el.poller.SetYield(el.pollYield())
 	err := el.poller.Polling(func(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
 		c := el.connections.getConn(fd)
 		if c == nil {

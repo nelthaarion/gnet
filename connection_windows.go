@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -51,27 +52,58 @@ type openConn struct {
 }
 
 type conn struct {
-	pc            net.PacketConn
-	ctx           any                 // user-defined context
-	safeCtx       atomic.Pointer[any] // safe user-defined context
-	loop          *eventloop          // owner event-loop
-	buffer        *bbPool.ByteBuffer  // reuse memory of inbound data as a temporary buffer
-	cache         []byte              // temporary cache for the inbound data
-	peekCaches    [][]byte            // allocated Peek results, valid until Discard/release
-	rawConn       net.Conn            // original connection
-	localAddr     net.Addr            // local server addr
-	remoteAddr    net.Addr            // remote addr
-	inboundBuffer elastic.RingBuffer  // buffer for data from the remote
+	pc         net.PacketConn
+	ctx        any                 // user-defined context
+	safeCtx    atomic.Pointer[any] // safe user-defined context
+	loop       *eventloop          // owner event-loop
+	buffer     *bbPool.ByteBuffer  // reuse memory of inbound data as a temporary buffer
+	cache      []byte              // temporary cache for the inbound data
+	peekCaches [][]byte            // allocated Peek results, valid until Discard/release
+	// held reports that a Peek/Next/WriteTo result still aliases the connection's
+	// inbound buffer. Such a result has to stay valid until the next Discard or
+	// release, so while it is set the inbound buffer must not be returned to the
+	// pool. Discard and release are the only places that clear it.
+	held          bool
+	rawConn       net.Conn           // original connection
+	localAddr     net.Addr           // local server addr
+	remoteAddr    net.Addr           // remote addr
+	inboundBuffer elastic.RingBuffer // buffer for data from the remote
 }
+
+// tcpConnPool recycles the small wrapper that carries one arrival through the
+// event-loop queue. packTCPConn runs once per arrival, so allocating a fresh
+// wrapper every time made it the largest single allocation source in the inbound
+// path (97% of all allocations in the inbound-pipeline profile). A wrapper is
+// recycled only once the event loop is finished with it, and each arrival is
+// finished by exactly one of unpackTCPConn or finishPending, which are the two
+// places that return one.
+var tcpConnPool = sync.Pool{New: func() any { return new(tcpConn) }}
 
 func packTCPConn(c *conn, buf []byte) *tcpConn {
+	tc := tcpConnPool.Get().(*tcpConn)
 	b := bbPool.Get()
 	_, _ = b.Write(buf)
-	return &tcpConn{c: c, b: b}
+	tc.c = c
+	tc.b = b
+	return tc
 }
 
+// unpackTCPConn hands one arrival to its connection.
+//
+// The packed buffer becomes the connection's inbound buffer instead of having its
+// contents copied into the connection's buffer: the payload already sits at the
+// front of a pooled block, so copying it again doubles the memory traffic of every
+// arrival and forces the connection's buffer to grow. Ownership transfer removes
+// that second copy; the block the connection held before is retired to the pool.
+//
+// Retiring it is only safe while nothing can still see it. Peek and Next may hand
+// out a slice that aliases the connection's inbound buffer, and such a slice has
+// to remain valid until the next Discard or release, exactly as it does today.
+// conn.held records whether one is outstanding; while it is, the old block is
+// written into in place, which is the behaviour this function always had.
 func unpackTCPConn(tc *tcpConn) *conn {
-	if tc.c.buffer == nil { // the connection has been closed
+	c := tc.c
+	if c == nil || c.buffer == nil { // the connection has been closed
 		// FIX L-9: this returned without releasing tc.b. packTCPConn took that buffer
 		// from bbPool, so whichever branch is taken it has to go back — dropping it
 		// here means the pool is drained by exactly the connections that close early,
@@ -80,10 +112,38 @@ func unpackTCPConn(tc *tcpConn) *conn {
 		tc.b = nil
 		return nil
 	}
-	_, _ = tc.c.buffer.Write(tc.b.B)
-	bbPool.Put(tc.b)
+
+	if c.held {
+		// An alias into the current inbound block is still live, so that block
+		// must stay where it is and be written into in place.
+		_, _ = c.buffer.Write(tc.b.B)
+		bbPool.Put(tc.b)
+		tc.b = nil
+		return c
+	}
+
+	prev := c.buffer
+	if len(prev.B) > 0 {
+		// The handler left data unconsumed. It has to stay ahead of the new
+		// payload so ordering is preserved, so the incoming block grows to hold
+		// it — prepending into the previous block cannot work because its front
+		// has already been consumed and re-sliced away.
+		grown := bbPool.Get()
+		grown.B = append(grown.B, prev.B...)
+		grown.B = append(grown.B, tc.b.B...)
+		bbPool.Put(prev)
+		bbPool.Put(tc.b)
+		tc.b = nil
+		c.buffer = grown
+		return c
+	}
+
+	// Nothing was left behind, so the previous block holds nothing and can go
+	// straight back to the pool.
+	bbPool.Put(prev)
+	c.buffer = tc.b
 	tc.b = nil
-	return tc.c
+	return c
 }
 
 func packUDPConn(c *conn, buf []byte) *udpConn {
@@ -104,8 +164,12 @@ func newStreamConn(el *eventloop, nc net.Conn, ctx any) (c *conn) {
 	return c
 }
 
+// release returns every pooled block the connection owns to its pool and drops
+// the references the caller could still hold. After it, c.buffer is nil, so
+// Peek/Read/Next/WriteTo and unpackTCPConn all report the connection as closed.
 func (c *conn) release() {
 	c.releasePeekCaches()
+	c.held = false
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.localAddr = nil
@@ -192,8 +256,15 @@ func (c *conn) Next(n int) (buf []byte, err error) {
 		n = totalLen
 	}
 	if c.inboundBuffer.IsEmpty() {
+		if c.buffer == nil {
+			return nil, net.ErrClosed
+		}
 		buf = c.buffer.B[:n]
 		c.buffer.B = c.buffer.B[n:]
+		// The result aliases the inbound buffer: hand out the reference, but
+		// remember that it is outstanding so the block is not recycled while
+		// the caller can still see it.
+		c.held = true
 		return
 	}
 
@@ -222,6 +293,11 @@ func (c *conn) Peek(n int) (buf []byte, err error) {
 		n = totalLen
 	}
 	if c.inboundBuffer.IsEmpty() {
+		if c.buffer == nil {
+			return nil, net.ErrClosed
+		}
+		// The result aliases the inbound buffer: see Next for why it is recorded.
+		c.held = true
 		return c.buffer.B[:n], err
 	}
 	head, tail := c.inboundBuffer.Peek(n)
@@ -240,6 +316,7 @@ func (c *conn) Peek(n int) (buf []byte, err error) {
 
 func (c *conn) Discard(n int) (int, error) {
 	c.releasePeekCaches()
+	c.held = false
 	if len(c.cache) > 0 {
 		bsPool.Put(c.cache)
 		c.cache = nil
@@ -347,6 +424,9 @@ func (c *conn) WriteTo(w io.Writer) (n int64, err error) {
 	if c.buffer == nil || len(c.buffer.B) == 0 {
 		return n, nil
 	}
+	// The writer is handed the inbound buffer, and may keep it: record the
+	// reference so the block is not recycled from under it.
+	c.held = true
 	m, writeErr := w.Write(c.buffer.B)
 	if m < 0 || m > len(c.buffer.B) {
 		panic("Conn.WriteTo: invalid Write count")

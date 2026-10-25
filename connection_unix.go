@@ -54,7 +54,30 @@ type conn struct {
 	isDatagram     bool                   // UDP protocol
 	opened         bool                   // connection opened event fired
 	isEOF          bool                   // whether the connection has reached EOF
+	cork           corkState              // write-coalescing state of the OnTraffic callback that is running
+	corkDirty      bool                   // writes were buffered by coalescing, flush when the callback returns
 }
+
+// corkState is the write-coalescing state of the OnTraffic (or Wake) callback that is
+// currently running on a connection.
+//
+// A callback that handles several requests per read - HTTP pipelining, Redis-style
+// batches, framed RPC, WebSocket bursts - typically answers each of them with its own
+// Write, and every Write is a write(2). The first Write of a callback still goes
+// straight to the kernel, so the common one-request-one-response exchange pays
+// nothing extra and its latency is untouched; the Writes that follow it in the same
+// callback are appended to the outbound buffer instead and leave in one write(2)
+// when the callback returns. N pipelined responses cost two write(2) calls, not N.
+//
+// Coalescing only exists in level-triggered mode. In edge-triggered mode the event
+// loop must drain the socket before it returns, so every write stays immediate.
+type corkState uint8
+
+const (
+	corkOff   corkState = iota // no callback is running (or ET mode): writes go straight to the kernel
+	corkOpen                   // a callback is running and has not written yet
+	corkArmed                  // the callback has made its first, direct write: the next ones are buffered
+)
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
 	c = &conn{
@@ -93,6 +116,7 @@ func (c *conn) release() {
 	c.releasePeekCaches()
 	c.opened = false
 	c.isEOF = false
+	c.cork, c.corkDirty = corkOff, false
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.buffer = nil
@@ -131,7 +155,7 @@ func (c *conn) open(buf []byte) error {
 	}
 
 	for {
-		n, err := unix.Write(c.fd, buf)
+		n, err := gio.WriteNB(c.fd, buf)
 		if err != nil {
 			if err == unix.EAGAIN {
 				_, _ = c.outboundBuffer.Write(buf)
@@ -160,6 +184,17 @@ func (c *conn) write(data []byte) (n int, err error) {
 		return
 	}
 
+	// Write coalescing, see corkState: the first Write of an OnTraffic callback is sent
+	// right away, every later one is buffered and flushed once the callback returns.
+	if c.cork != corkOff {
+		if c.cork == corkArmed {
+			_, _ = c.outboundBuffer.Write(data)
+			c.corkDirty = true
+			return
+		}
+		c.cork = corkArmed
+	}
+
 	// The old body opened this function with a `defer func(){ if err != nil {
 	// c.loop.close(...) } }()`. The closure made the write path non-inlinable
 	// and forced the error case through an indirection; the error paths below
@@ -167,7 +202,7 @@ func (c *conn) write(data []byte) (n int, err error) {
 
 	var sent int
 loop:
-	if sent, err = unix.Write(c.fd, data); err != nil {
+	if sent, err = gio.WriteNB(c.fd, data); err != nil {
 		// A temporary error occurs, append the data to outbound buffer,
 		// writing it back to the remote in the next round for LT mode.
 		if err == unix.EAGAIN {
@@ -224,6 +259,16 @@ func (c *conn) writev(bs [][]byte) (n int, err error) {
 	if !c.outboundBuffer.IsEmpty() {
 		_, _ = c.outboundBuffer.Writev(bs)
 		return
+	}
+
+	// Write coalescing, see corkState and conn.write.
+	if c.cork != corkOff {
+		if c.cork == corkArmed {
+			_, _ = c.outboundBuffer.Writev(bs)
+			c.corkDirty = true
+			return
+		}
+		c.cork = corkArmed
 	}
 
 	// FIX M-2: writev(2) rejects an iovec list longer than IOV_MAX (1024 on Linux

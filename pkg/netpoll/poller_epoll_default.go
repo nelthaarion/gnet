@@ -30,15 +30,18 @@ import (
 	"golang.org/x/sys/unix"
 
 	errorx "github.com/nelthaarion/gnet/v2/pkg/errors"
+	gio "github.com/nelthaarion/gnet/v2/pkg/io"
 	"github.com/nelthaarion/gnet/v2/pkg/logging"
 	"github.com/nelthaarion/gnet/v2/pkg/queue"
 )
 
 // Poller represents a poller which is in charge of monitoring file-descriptors.
 type Poller struct {
+	pollYield // scheduler-yield policy, see SetYield
+
 	// lifecycle protects task admission and wakeup descriptors against Close.
 	// Polling must have returned before Close, as required by the engine lifecycle.
-	lifecycle sync.RWMutex
+	lifecycle                   sync.RWMutex
 	fd                          int    // epoll fd
 	efd                         int    // eventfd
 	efdBuf                      []byte // efd buffer to read an 8-byte integer
@@ -128,9 +131,9 @@ func (p *Poller) Trigger(priority queue.EventPriority, fn queue.Func, param any)
 	}
 	if atomic.CompareAndSwapInt32(&p.wakeupCall, 0, 1) {
 		for {
-			_, err = unix.Write(p.efd, b)
+			_, err = gio.WriteNB(p.efd, b)
 			if err == unix.EAGAIN {
-				_, _ = unix.Read(p.efd, p.efdBuf)
+				_, _ = gio.ReadNB(p.efd, p.efdBuf)
 				continue
 			}
 			break
@@ -144,18 +147,30 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 	el := newEventList(InitPollEventsCap)
 	var doChores bool
 
+	// With the yield policy on (the default) the loop polls once more without
+	// blocking after every batch and, if that finds nothing, gives the scheduler a
+	// chance to run goroutines that the callbacks made runnable before it blocks
+	// in the kernel. With it off (Options.NoPollYield, see
+	// pollYield) there is nothing to gain from that detour, so the loop goes
+	// straight back to the blocking wait: one syscall and no scheduler round trip
+	// per idle transition instead of two syscalls and a Gosched.
+	yield := !p.noYield
 	msec := -1
 	for {
-		n, err := unix.EpollWait(p.fd, el.events, msec)
+		n, err := epollWait(p.fd, el.events, msec)
 		if n == 0 || (n < 0 && err == unix.EINTR) {
 			msec = -1
-			runtime.Gosched()
+			if yield {
+				runtime.Gosched()
+			}
 			continue
 		} else if err != nil {
 			logging.Errorf("error occurs in epoll: %v", os.NewSyscallError("epoll_wait", err))
 			return err
 		}
-		msec = 0
+		if yield {
+			msec = 0
+		}
 
 		for i := 0; i < n; i++ {
 			ev := &el.events[i]
@@ -167,7 +182,9 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 				doChores = true
 			} else {
 				err = callback(fd, ev.Events, 0)
-				if errors.Is(err, errorx.ErrAcceptSocket) || errors.Is(err, errorx.ErrEngineShutdown) {
+				// err is nil for virtually every event: test that first instead of
+				// calling errors.Is (a non-inlined call) twice per event.
+				if err != nil && (errors.Is(err, errorx.ErrAcceptSocket) || errors.Is(err, errorx.ErrEngineShutdown)) {
 					return err
 				}
 			}
@@ -178,7 +195,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 			task := p.urgentAsyncTaskQueue.Dequeue()
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)
-				if errors.Is(err, errorx.ErrEngineShutdown) {
+				if err != nil && errors.Is(err, errorx.ErrEngineShutdown) {
 					// FIX L-11: this task is as much a pooled object as any other and
 					// used to be dropped on the way out — one leaked *Task per poller
 					// shutdown. The tasks still queued are returned unexecuted for the
@@ -194,7 +211,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 					break
 				}
 				err = task.Exec(task.Param)
-				if errors.Is(err, errorx.ErrEngineShutdown) {
+				if err != nil && errors.Is(err, errorx.ErrEngineShutdown) {
 					queue.PutTask(task)
 					discardPendingTasks(p.urgentAsyncTaskQueue, p.asyncTaskQueue)
 					return err
@@ -204,9 +221,9 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 			atomic.StoreInt32(&p.wakeupCall, 0)
 			if (!p.asyncTaskQueue.IsEmpty() || !p.urgentAsyncTaskQueue.IsEmpty()) && atomic.CompareAndSwapInt32(&p.wakeupCall, 0, 1) {
 				for {
-					_, err = unix.Write(p.efd, b)
+					_, err = gio.WriteNB(p.efd, b)
 					if err == unix.EAGAIN {
-						_, _ = unix.Read(p.efd, p.efdBuf)
+						_, _ = gio.ReadNB(p.efd, p.efdBuf)
 						continue
 					}
 					if err != nil {
@@ -217,11 +234,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 			}
 		}
 
-		if n == el.size {
-			el.expand()
-		} else if n < el.size>>1 {
-			el.shrink()
-		}
+		el.adapt(n)
 	}
 }
 
@@ -250,7 +263,7 @@ func epollAdd(epfd int, op int, pa *PollAttachment, ev uint32) error {
 			"epoll_event struct can carry", pa.FD)
 	}
 	return os.NewSyscallError("epoll_ctl",
-		unix.EpollCtl(epfd, op, pa.FD, &unix.EpollEvent{
+		epollCtl(epfd, op, pa.FD, &epollevent{
 			Fd:     int32(pa.FD), // safe: guarded above
 			Events: ev,
 		}))
@@ -303,5 +316,5 @@ func (p *Poller) ModReadWrite(pa *PollAttachment, edgeTriggered bool) error {
 
 // Delete removes the given file descriptor from the poller.
 func (p *Poller) Delete(fd int) error {
-	return os.NewSyscallError("epoll_ctl del", unix.EpollCtl(p.fd, unix.EPOLL_CTL_DEL, fd, nil))
+	return os.NewSyscallError("epoll_ctl del", epollCtl(p.fd, unix.EPOLL_CTL_DEL, fd, nil))
 }

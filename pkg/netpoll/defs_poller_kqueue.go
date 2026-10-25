@@ -55,10 +55,34 @@ func IsErrorEvent(_ IOEvent, flags IOFlags) bool {
 type eventList struct {
 	size   int
 	events []unix.Kevent_t
+	low    int // consecutive polls that returned fewer than size/2 events
 }
 
 func newEventList(size int) *eventList {
-	return &eventList{size, make([]unix.Kevent_t, size)}
+	return &eventList{size: size, events: make([]unix.Kevent_t, size)}
+}
+
+// shrinkAfterPolls is how many polls in a row have to come back less than half
+// full before the event array is halved.
+const shrinkAfterPolls = 64
+
+// adapt resizes the event array to the load that the last poll saw: it doubles
+// when the poll filled it completely, and halves it only after a sustained run of
+// polls that used less than half of it, so that a load hovering around a power of
+// two does not allocate a fresh array on every poll.
+func (el *eventList) adapt(n int) {
+	switch {
+	case n == el.size:
+		el.low = 0
+		el.expand()
+	case n < el.size>>1:
+		if el.low++; el.low >= shrinkAfterPolls {
+			el.low = 0
+			el.shrink()
+		}
+	default:
+		el.low = 0
+	}
 }
 
 func (el *eventList) expand() {

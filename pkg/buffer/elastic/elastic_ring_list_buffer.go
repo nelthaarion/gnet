@@ -66,6 +66,20 @@ func (mb *Buffer) Peek(n int) ([][]byte, error) {
 	return mb.listBuffer.PeekWithBytes(n, head, tail)
 }
 
+// PeekStatic returns the data held in the ring (static) part of the buffer as at
+// most two slices, head and tail, without allocating and without consuming
+// anything; Discard removes what has been sent. complete reports that nothing is
+// buffered beyond the ring, i.e. that head followed by tail is the whole content.
+//
+// Peek has to assemble a [][]byte for the general case, which costs two
+// allocations on every call; callers on the hot write path use PeekStatic to
+// send the common case, a buffer that lives entirely in the ring, with a plain
+// write(2) and fall back to Peek only when the list part is involved.
+func (mb *Buffer) PeekStatic() (head, tail []byte, complete bool) {
+	head, tail = mb.ringBuffer.Peek(math.MaxInt32)
+	return head, tail, mb.listBuffer.IsEmpty()
+}
+
 // Discard discards n bytes in this buffer.
 func (mb *Buffer) Discard(n int) (discarded int, err error) {
 	discarded, err = mb.ringBuffer.Discard(n)

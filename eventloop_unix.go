@@ -96,6 +96,12 @@ func (el *eventloop) getLogger() logging.Logger {
 	return el.engine.opts.Logger
 }
 
+// pollYield reports whether the poller of this event-loop should yield to the Go
+// scheduler before it blocks, see Options.NoPollYield.
+func (el *eventloop) pollYield() bool {
+	return !el.engine.opts.NoPollYield
+}
+
 func (el *eventloop) countConn() int32 {
 	return el.connections.loadCount()
 }
@@ -289,7 +295,7 @@ func (el *eventloop) read(c *conn) error {
 	isET := el.engine.opts.EdgeTriggeredIO
 	chunk := el.engine.opts.EdgeTriggeredIOChunk
 loop:
-	n, err := unix.Read(c.fd, el.buffer)
+	n, err := gio.ReadNB(c.fd, el.buffer)
 	if err != nil || n == 0 {
 		if err == unix.EAGAIN {
 			return nil
@@ -302,11 +308,21 @@ loop:
 	recv += n
 
 	c.buffer = el.buffer[:n]
+	if !isET && !el.engine.opts.NoWriteCoalescing {
+		c.cork = corkOpen // open the write-coalescing window, see corkState
+	}
 	action := el.eventHandler.OnTraffic(c)
+	flush := c.corkDirty
+	c.cork, c.corkDirty = corkOff, false
 	switch action {
 	case None:
+		if flush && c.opened {
+			if err = el.flushCoalesced(c); err != nil || !c.opened {
+				return err
+			}
+		}
 	case Close:
-		return el.close(c, nil)
+		return el.close(c, nil) // close sends whatever the callback left in the outbound buffer
 	case Shutdown:
 		return errorx.ErrEngineShutdown
 	}
@@ -355,14 +371,14 @@ loop:
 	// unconditionally in that case, paying an extra iovec and a heavier syscall
 	// per flush on the overwhelmingly common single-segment buffer.
 	if len(iov) == 2 && len(iov[1]) == 0 {
-		n, err = unix.Write(c.fd, iov[0])
+		n, err = gio.WriteNB(c.fd, iov[0])
 	} else if len(iov) > 1 {
 		if len(iov) > iovMax {
 			iov = iov[:iovMax]
 		}
 		n, err = gio.Writev(c.fd, iov)
 	} else {
-		n, err = unix.Write(c.fd, iov[0])
+		n, err = gio.WriteNB(c.fd, iov[0])
 	}
 	_, _ = c.outboundBuffer.Discard(n)
 	switch err {
@@ -392,6 +408,60 @@ loop:
 		return el.poller.Trigger(queue.HighPriority, el.write0, c)
 	}
 
+	return nil
+}
+
+// flushCoalesced sends the data that conn.write and conn.writev buffered while an
+// OnTraffic callback was running (see corkState). It runs once, right after the
+// callback returns, and replaces what would have been one write(2) per Write call
+// with as few as one.
+//
+// Level-triggered mode only: the descriptor is not registered for writable events at
+// this point, so whatever the kernel does not take now is handed to the poller by
+// switching the registration to read+write, exactly as an immediate write that
+// hit a full socket buffer does.
+func (el *eventloop) flushCoalesced(c *conn) error {
+	for !c.outboundBuffer.IsEmpty() {
+		var (
+			n   int
+			err error
+		)
+		// Common case: everything sits in the ring part of the buffer, send the
+		// first contiguous run with a plain write(2) and no allocation.
+		if head, _, _ := c.outboundBuffer.PeekStatic(); len(head) > 0 {
+			n, err = gio.WriteNB(c.fd, head)
+			if n > 0 {
+				_, _ = c.outboundBuffer.Discard(n)
+			}
+			if err == nil && n < len(head) {
+				break // the socket buffer is full, wait for EPOLLOUT
+			}
+		} else { // only the list part holds data: gather it with writev
+			iov, _ := c.outboundBuffer.Peek(-1)
+			if len(iov) == 0 {
+				break
+			}
+			if len(iov) > iovMax {
+				iov = iov[:iovMax]
+			}
+			n, err = gio.Writev(c.fd, iov)
+			if n > 0 {
+				_, _ = c.outboundBuffer.Discard(n)
+			}
+			if err == nil && n == 0 {
+				break // no progress, do not spin
+			}
+		}
+		if err != nil {
+			if err == unix.EAGAIN {
+				break
+			}
+			return el.close(c, os.NewSyscallError("write", err))
+		}
+	}
+	if !c.outboundBuffer.IsEmpty() {
+		return el.poller.ModReadWrite(&c.pollAttachment, false)
+	}
 	return nil
 }
 
@@ -447,7 +517,17 @@ func (el *eventloop) wake(c *conn) error {
 		return nil // ignore stale connections
 	}
 
+	if !el.engine.opts.EdgeTriggeredIO && !el.engine.opts.NoWriteCoalescing {
+		c.cork = corkOpen // open the write-coalescing window, see corkState
+	}
 	action := el.eventHandler.OnTraffic(c)
+	flush := c.corkDirty
+	c.cork, c.corkDirty = corkOff, false
+	if flush && action == None && c.opened {
+		if err := el.flushCoalesced(c); err != nil || !c.opened {
+			return err
+		}
+	}
 
 	return el.handleAction(c, action)
 }

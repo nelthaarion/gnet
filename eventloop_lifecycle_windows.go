@@ -57,7 +57,13 @@ func (el *eventloop) finishPending() {
 					v.cb(errorx.ErrEngineInShutdown)
 				}
 			case *tcpConn:
+				// The wrapper is left to the GC: the arrival it carried never
+				// reached unpackTCPConn, so its connection pointer may still be
+				// referenced by the handler bookkeeping being torn down. Only
+				// readTCP recycles a wrapper, on the one path that provably
+				// owns it alone.
 				bbPool.Put(v.b)
+				v.b = nil
 			case *udpConn:
 				v.c.release()
 			case func() error:
