@@ -98,7 +98,7 @@ type Options struct {
 	LockOSThread bool
 
 	// NoPollYield disables the scheduler yield that an event-loop performs when it runs out of
-	// events: by default an idle loop polls once more without blocking and, if that finds nothing,
+	// events: an idle loop polls once more without blocking and, if that finds nothing,
 	// calls runtime.Gosched so that goroutines which the event callbacks have just made runnable
 	// (worker pools, goroutines that call AsyncWrite, ...) run on the loop's P immediately before
 	// the loop blocks in the kernel. That detour costs a trip through the Go scheduler (and, in a
@@ -106,26 +106,52 @@ type Options struct {
 	// system call on every idle transition, and buys nothing for a server that handles its
 	// traffic inline in OnTraffic and never hands work to other goroutines.
 	//
-	// Set it for such servers to go straight back to the blocking wait. The effect is largest at
-	// low and medium concurrency, where almost every request is its own batch of events: there it
-	// removed about a sixth of the server's CPU time per request in the benchmarks that come with
-	// this repository; under saturating load it makes no difference. Do not set it if callbacks
-	// hand work to other goroutines that should run before the loop goes back to sleep, and be
-	// careful with LockOSThread in a process that has fewer Ps than locked loops: the yield is then
-	// what hands the P over to the next locked loop.
-	// The default (false) keeps the behavior of upstream gnet.
+	// By default the yield is adaptive for the event-loops that serve established connections, in a
+	// process that has more Ps (GOMAXPROCS) than event-loops: such a loop yields while other
+	// goroutines have recently handed work to it (AsyncWrite, Wake, Close from outside the loop,
+	// connections accepted by the main reactor, ...), which is the sign that goroutines may be
+	// waiting for its P, and goes straight back to the blocking wait while it serves its traffic
+	// inline; goroutines that its callbacks make runnable can then run on a P that no loop is
+	// using. Everywhere else the loop yields as before: the loops that accept connections
+	// themselves (the main reactor, and the loops of a ReusePort server), a server with as many
+	// loops as Ps (which is what Multicore gives), a process with a single P, and loops that are
+	// locked to their thread (LockOSThread). Goroutines that a callback spawns and that never call
+	// back into the engine are, while a loop is not yielding, scheduled by the runtime in the usual
+	// way (an idle P picks them up) and no longer run at the loop's next idle transition; see
+	// AlwaysPollYield.
+	//
+	// Set NoPollYield to skip the yield altogether, also for loops that are fed from other
+	// goroutines. The effect is largest at low and medium concurrency, where almost every request
+	// is its own batch of events: there the yield cost about a sixth of the server's CPU time per
+	// request in the benchmarks that come with this repository; under saturating load it makes no
+	// difference. Be careful with it together with LockOSThread in a process that has fewer Ps
+	// than locked loops: the yield is then what hands the P over to the next locked loop.
 	NoPollYield bool
+
+	// AlwaysPollYield makes every idle event-loop yield to the scheduler before it blocks, whether or
+	// not other goroutines have recently handed work to it: the behavior of upstream gnet and the
+	// default of this fork before the yield became adaptive, see NoPollYield. Set it if callbacks
+	// spawn goroutines that run without ever calling back into the engine (so the loop has no way
+	// to know that they are waiting) and that must not wait for another P to pick them up.
+	// NoPollYield takes precedence when both are set.
+	AlwaysPollYield bool
 
 	// NoWriteCoalescing turns off write coalescing. By default (level-triggered mode only) the
 	// first Write of an OnTraffic callback is sent to the kernel right away and every further Write
 	// of the same callback is appended to the outbound buffer and sent with a single write(2) when
 	// the callback returns, so that a callback which answers N pipelined requests with N Writes costs
-	// two system calls instead of N. The byte stream the peer sees is the same either way.
+	// two system calls instead of N. A connection whose previous callback wrote more than once is
+	// taken to be pipelining and holds back the first Write too, as long as it is small (4 KiB or
+	// less), which brings the N Writes down to a single system call; a callback that writes only
+	// once puts the connection back to the direct first Write. The byte stream the peer sees is the
+	// same in every case.
 	//
 	// The differences are visible only to the callback itself: Conn.OutboundBuffered reports the
-	// buffered bytes until the callback returns, and a failure of the deferred write surfaces through
-	// OnClose instead of as the error of the Write call. Set NoWriteCoalescing for the strict
-	// "every Write is a write(2) right now" behavior of upstream gnet.
+	// buffered bytes until the callback returns, a failure of the deferred write surfaces through
+	// OnClose instead of as the error of the Write call, and the data of a held-back Write leaves
+	// when the callback returns rather than inside it (call Conn.Flush to push it out earlier).
+	// Set NoWriteCoalescing for the strict "every Write is a write(2) right now" behavior of
+	// upstream gnet.
 	NoWriteCoalescing bool
 
 	// Ticker indicates whether the ticker has been set up.
@@ -225,6 +251,14 @@ func WithNoWriteCoalescing(noWriteCoalescing bool) Option {
 func WithNoPollYield(noPollYield bool) Option {
 	return func(opts *Options) {
 		opts.NoPollYield = noPollYield
+	}
+}
+
+// WithAlwaysPollYield makes every idle event-loop yield to the scheduler before it blocks in the
+// kernel, see Options.AlwaysPollYield.
+func WithAlwaysPollYield(alwaysPollYield bool) Option {
+	return func(opts *Options) {
+		opts.AlwaysPollYield = alwaysPollYield
 	}
 }
 

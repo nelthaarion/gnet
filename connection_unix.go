@@ -56,6 +56,8 @@ type conn struct {
 	isEOF          bool                   // whether the connection has reached EOF
 	cork           corkState              // write-coalescing state of the OnTraffic callback that is running
 	corkDirty      bool                   // writes were buffered by coalescing, flush when the callback returns
+	corkBatch      bool                   // the previous callback wrote more than once: hold back all writes of the next one
+	corkN          uint32                 // writes made since the coalescing window of the current callback opened
 }
 
 // corkState is the write-coalescing state of the OnTraffic (or Wake) callback that is
@@ -69,6 +71,15 @@ type conn struct {
 // callback are appended to the outbound buffer instead and leave in one write(2)
 // when the callback returns. N pipelined responses cost two write(2) calls, not N.
 //
+// A connection whose previous callback wrote more than once is assumed to be
+// pipelining and its next callback holds back even the first Write (as long as it is
+// small, see corkHoldMax): all N responses then leave in a single write(2) when the
+// callback returns. One extra write(2) per batch is the largest single cost of the
+// pipelined case, as much as sending the other N-1 responses together. A callback
+// that turns out to write only once is not hurt by the guess: its Write is merely
+// sent when the callback returns instead of inside it, and the next callback is back
+// to the direct first Write.
+//
 // Coalescing only exists in level-triggered mode. In edge-triggered mode the event
 // loop must drain the socket before it returns, so every write stays immediate.
 type corkState uint8
@@ -76,8 +87,37 @@ type corkState uint8
 const (
 	corkOff   corkState = iota // no callback is running (or ET mode): writes go straight to the kernel
 	corkOpen                   // a callback is running and has not written yet
-	corkArmed                  // the callback has made its first, direct write: the next ones are buffered
+	corkHold                   // like corkOpen, but the connection pipelines: even the first (small) write is buffered
+	corkArmed                  // the callback has made its first write: the next ones are buffered
 )
+
+// corkHoldMax is the largest first Write that corkHold buffers. Copying a bigger
+// one into the outbound buffer costs more than the write(2) it could save, so it is
+// sent directly, as in corkOpen.
+const corkHoldMax = 4 << 10
+
+// openCork opens the write-coalescing window of an OnTraffic (or Wake) callback.
+func (c *conn) openCork() {
+	c.corkN = 0
+	if c.corkBatch {
+		c.cork = corkHold
+	} else {
+		c.cork = corkOpen
+	}
+}
+
+// closeCork closes the window that openCork opened (opened tells whether there was
+// one) and reports whether the callback left writes in the outbound buffer that have
+// to be flushed now. It also remembers whether the callback wrote more than once,
+// which decides how the next one starts.
+func (c *conn) closeCork(opened bool) (flush bool) {
+	flush = c.corkDirty
+	if opened {
+		c.corkBatch = c.corkN > 1
+	}
+	c.cork, c.corkDirty = corkOff, false
+	return
+}
 
 func newStreamConn(proto string, fd int, el *eventloop, sa unix.Sockaddr, localAddr, remoteAddr net.Addr) (c *conn) {
 	c = &conn{
@@ -116,7 +156,7 @@ func (c *conn) release() {
 	c.releasePeekCaches()
 	c.opened = false
 	c.isEOF = false
-	c.cork, c.corkDirty = corkOff, false
+	c.cork, c.corkDirty, c.corkBatch, c.corkN = corkOff, false, false, 0
 	c.ctx = nil
 	c.safeCtx.Store(nil)
 	c.buffer = nil
@@ -175,6 +215,7 @@ func (c *conn) open(buf []byte) error {
 func (c *conn) write(data []byte) (n int, err error) {
 	isET := c.loop.engine.opts.EdgeTriggeredIO
 	n = len(data)
+	c.corkN++
 	// If there is pending data in outbound buffer,
 	// the current data ought to be appended to the
 	// outbound buffer for maintaining the sequence
@@ -185,9 +226,11 @@ func (c *conn) write(data []byte) (n int, err error) {
 	}
 
 	// Write coalescing, see corkState: the first Write of an OnTraffic callback is sent
-	// right away, every later one is buffered and flushed once the callback returns.
+	// right away (unless the connection pipelines), every later one is buffered and
+	// flushed once the callback returns.
 	if c.cork != corkOff {
-		if c.cork == corkArmed {
+		if c.cork == corkArmed || (c.cork == corkHold && n <= corkHoldMax) {
+			c.cork = corkArmed
 			_, _ = c.outboundBuffer.Write(data)
 			c.corkDirty = true
 			return
@@ -251,6 +294,7 @@ func (c *conn) writev(bs [][]byte) (n int, err error) {
 	for _, b := range bs {
 		n += len(b)
 	}
+	c.corkN++
 
 	// If there is pending data in outbound buffer,
 	// the current data ought to be appended to the
@@ -263,7 +307,8 @@ func (c *conn) writev(bs [][]byte) (n int, err error) {
 
 	// Write coalescing, see corkState and conn.write.
 	if c.cork != corkOff {
-		if c.cork == corkArmed {
+		if c.cork == corkArmed || (c.cork == corkHold && n <= corkHoldMax) {
+			c.cork = corkArmed
 			_, _ = c.outboundBuffer.Writev(bs)
 			c.corkDirty = true
 			return

@@ -50,7 +50,7 @@ func (el *eventloop) orbit() error {
 		defer runtime.UnlockOSThread()
 	}
 
-	el.poller.SetYield(el.pollYield())
+	el.setupAdaptivePollYield()
 	err := el.poller.Polling(func(fd int, ev netpoll.IOEvent, flags netpoll.IOFlags) error {
 		c := el.connections.getConn(fd)
 		if c == nil {

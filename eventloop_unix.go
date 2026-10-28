@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -96,10 +97,34 @@ func (el *eventloop) getLogger() logging.Logger {
 	return el.engine.opts.Logger
 }
 
-// pollYield reports whether the poller of this event-loop should yield to the Go
+// pollYield reports whether the poller of this event-loop may yield to the Go
 // scheduler before it blocks, see Options.NoPollYield.
 func (el *eventloop) pollYield() bool {
 	return !el.engine.opts.NoPollYield
+}
+
+// setupAdaptivePollYield installs the yield policy of a sub-reactor, a loop that serves
+// the connections the main reactor hands to it (orbit). Unless NoPollYield is set the
+// policy is adaptive: the loop yields while other goroutines are handing work to it and
+// skips the yield, and the extra system call that comes with it, while it serves its
+// traffic inline. That only happens in a process that has more Ps than event-loops: a
+// goroutine that a callback makes runnable can then always go to a P that no loop is
+// using, whereas with a P per loop (what Multicore gives) the yield is how such a
+// goroutine gets to run, and the benchmarks gave no reason to take it away there. A loop
+// that is locked to its thread keeps the unconditional yield too: it is what hands the P
+// over to the next locked loop in a process that has fewer Ps than locked loops.
+// AlwaysPollYield asks for the unconditional yield.
+//
+// The pollers that accept connections themselves (the main reactor, rotate, and the loops
+// of a ReusePort server, run) are not adaptive: they are woken by the kernel and not
+// through the task queues, so nothing would ever tell them that work is flowing, and on
+// connection-churn workloads a main reactor that skipped the yield cost a fifth to a
+// quarter of the throughput in the benchmarks.
+func (el *eventloop) setupAdaptivePollYield() {
+	opts := el.engine.opts
+	el.poller.SetYield(el.pollYield())
+	el.poller.SetAdaptiveYield(!opts.LockOSThread && !opts.AlwaysPollYield &&
+		runtime.GOMAXPROCS(0) > determineEventLoops(opts))
 }
 
 func (el *eventloop) countConn() int32 {
@@ -308,12 +333,12 @@ loop:
 	recv += n
 
 	c.buffer = el.buffer[:n]
-	if !isET && !el.engine.opts.NoWriteCoalescing {
-		c.cork = corkOpen // open the write-coalescing window, see corkState
+	coalesce := !isET && !el.engine.opts.NoWriteCoalescing
+	if coalesce {
+		c.openCork() // open the write-coalescing window, see corkState
 	}
 	action := el.eventHandler.OnTraffic(c)
-	flush := c.corkDirty
-	c.cork, c.corkDirty = corkOff, false
+	flush := c.closeCork(coalesce)
 	switch action {
 	case None:
 		if flush && c.opened {
@@ -517,12 +542,12 @@ func (el *eventloop) wake(c *conn) error {
 		return nil // ignore stale connections
 	}
 
-	if !el.engine.opts.EdgeTriggeredIO && !el.engine.opts.NoWriteCoalescing {
-		c.cork = corkOpen // open the write-coalescing window, see corkState
+	coalesce := !el.engine.opts.EdgeTriggeredIO && !el.engine.opts.NoWriteCoalescing
+	if coalesce {
+		c.openCork() // open the write-coalescing window, see corkState
 	}
 	action := el.eventHandler.OnTraffic(c)
-	flush := c.corkDirty
-	c.cork, c.corkDirty = corkOff, false
+	flush := c.closeCork(coalesce)
 	if flush && action == None && c.opened {
 		if err := el.flushCoalesced(c); err != nil || !c.opened {
 			return err

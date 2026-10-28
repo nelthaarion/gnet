@@ -152,8 +152,12 @@ func (p *Poller) Polling() error {
 	var doChores bool
 
 	// See the default poller: with the yield policy off the loop skips the
-	// non-blocking re-poll and the Gosched and goes straight back to the blocking wait.
+	// non-blocking re-poll and the Gosched and goes straight back to the blocking wait;
+	// the adaptive policy does the same unless other goroutines have recently handed
+	// work to this loop through its task queues.
 	yield := !p.noYield
+	adaptive := p.adaptiveYield()
+	yieldLeft := yieldWindow
 	msec := -1
 	for {
 		n, err := epollWait(p.fd, el.events, msec)
@@ -169,6 +173,13 @@ func (p *Poller) Polling() error {
 		}
 		if yield {
 			msec = 0
+			if adaptive {
+				if yieldLeft > 0 {
+					yieldLeft--
+				} else {
+					msec = -1
+				}
+			}
 		}
 
 		for i := 0; i < n; i++ {
@@ -188,6 +199,7 @@ func (p *Poller) Polling() error {
 
 		if doChores {
 			doChores = false
+			yieldLeft = yieldWindow // somebody is feeding this loop from another goroutine
 			task := p.urgentAsyncTaskQueue.Dequeue()
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)

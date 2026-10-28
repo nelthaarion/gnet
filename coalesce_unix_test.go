@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -450,5 +451,182 @@ func TestWriteCoalescingObservable(t *testing.T) {
 				t.Fatal("handler never saw the whole batch")
 			}
 		})
+	}
+}
+
+// A connection whose previous callback wrote more than once is assumed to be pipelining: its next
+// callback holds back even the first Write until it returns (corkHold), and a callback that then
+// writes only once ends the guess. OutboundBuffered shows which mode a callback ran in; the byte
+// stream the peer sees must be the same in every case.
+func TestWriteCoalescingHoldsFirstWriteOfPipeliningConnection(t *testing.T) {
+	var want atomic.Int32 // number of requests the next callback must have seen before it answers
+	seen := make(chan [3]int, 8)
+	handler := func(c Conn) Action {
+		n := int(want.Load())
+		if n == 0 || c.InboundBuffered() < n*coalesceReqSize {
+			return None // wait until the whole batch has arrived
+		}
+		want.Store(0)
+		var got [3]int
+		for i := 0; i < n; i++ {
+			buf, _ := c.Next(coalesceReqSize)
+			idx := int(binary.BigEndian.Uint32(buf))
+			_, _ = c.Write(coalesceResponse(idx, 100))
+			if i < len(got) {
+				got[i] = c.OutboundBuffered()
+			}
+		}
+		seen <- got
+		return None
+	}
+	addr, stop := startCoalesceServer(t, handler)
+	defer stop()
+	conn := dialCoalesce(t, addr)
+	defer conn.Close()
+
+	next := 0
+	for round, tc := range []struct {
+		requests int
+		want     [3]int // OutboundBuffered after each of the first three Writes
+	}{
+		{3, [3]int{0, 100, 200}},   // first callback of the connection: the first Write goes out directly
+		{3, [3]int{100, 200, 300}}, // the previous callback wrote 3 times: everything is held back
+		{1, [3]int{100, 0, 0}},     // still held back, but this callback writes only once ...
+		{1, [3]int{0, 0, 0}},       // ... which ends the guess: the first Write goes out directly again
+		{2, [3]int{0, 100, 0}},     // two Writes are enough to start it again ...
+		{2, [3]int{100, 200, 0}},   // ... and the next callback holds back
+	} {
+		want.Store(int32(tc.requests))
+		if _, err := conn.Write(coalesceRequests(next, next+tc.requests)); err != nil {
+			t.Fatal(err)
+		}
+		readAndVerify(t, conn, next, next+tc.requests, 100, 10*time.Second)
+		next += tc.requests
+		select {
+		case got := <-seen:
+			if got != tc.want {
+				t.Fatalf("round %d: OutboundBuffered after each Write = %v, want %v", round, got, tc.want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the handler never answered", round)
+		}
+	}
+}
+
+// The first Write of a pipelining connection is held back only while it is small: a large one is
+// sent directly, as before, and everything has to arrive in order either way.
+func TestWriteCoalescingHoldLargeFirstWrite(t *testing.T) {
+	size := func(idx int) int {
+		if idx%3 == 0 {
+			return 3 * corkHoldMax // larger than corkHoldMax: never held back
+		}
+		return 40 + idx
+	}
+	handler := func(c Conn) Action {
+		for c.InboundBuffered() >= coalesceReqSize {
+			buf, _ := c.Next(coalesceReqSize)
+			idx := int(binary.BigEndian.Uint32(buf))
+			if _, err := c.Write(coalesceResponse(idx, size(idx))); err != nil {
+				return Close
+			}
+		}
+		return None
+	}
+	addr, stop := startCoalesceServer(t, handler)
+	defer stop()
+	conn := dialCoalesce(t, addr)
+	defer conn.Close()
+
+	verify := func(from, to int) {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		for i := from; i < to; i++ {
+			got := make([]byte, size(i))
+			if _, err := io.ReadFull(conn, got); err != nil {
+				t.Fatalf("response %d: %v", i, err)
+			}
+			if !bytes.Equal(got, coalesceResponse(i, size(i))) {
+				t.Fatalf("response %d is corrupted or out of order", i)
+			}
+		}
+	}
+	// 1, 2, 4, 5: small; 3 and 6 start the callbacks below with a large response.
+	for _, r := range [][2]int{{1, 5}, {6, 12}, {12, 13}, {13, 20}, {21, 22}, {24, 30}} {
+		if _, err := conn.Write(coalesceRequests(r[0], r[1])); err != nil {
+			t.Fatal(err)
+		}
+		verify(r[0], r[1])
+	}
+}
+
+// Writes that a callback held back must still be sent when it asks for the connection to be
+// closed, and before the EOF.
+func TestWriteCoalescingHoldThenClose(t *testing.T) {
+	handler := func(c Conn) Action {
+		for c.InboundBuffered() >= coalesceReqSize {
+			buf, _ := c.Next(coalesceReqSize)
+			idx := int(binary.BigEndian.Uint32(buf))
+			_, _ = c.Write(coalesceResponse(idx, 50))
+			if idx == 5 {
+				return Close
+			}
+		}
+		return None
+	}
+	addr, stop := startCoalesceServer(t, handler)
+	defer stop()
+	conn := dialCoalesce(t, addr)
+	defer conn.Close()
+	// The first callback writes three times, so the second one runs in hold mode.
+	if _, err := conn.Write(coalesceRequests(0, 3)); err != nil {
+		t.Fatal(err)
+	}
+	readAndVerify(t, conn, 0, 3, 50, 10*time.Second)
+	if _, err := conn.Write(coalesceRequests(3, 6)); err != nil {
+		t.Fatal(err)
+	}
+	readAndVerify(t, conn, 3, 6, 50, 10*time.Second)
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("expected EOF after the last response, got n=%d err=%v", n, err)
+	}
+}
+
+// Writev and Flush inside a callback that runs in hold mode.
+func TestWriteCoalescingHoldWritevAndFlush(t *testing.T) {
+	handler := func(c Conn) Action {
+		for c.InboundBuffered() >= coalesceReqSize {
+			buf, _ := c.Next(coalesceReqSize)
+			idx := int(binary.BigEndian.Uint32(buf))
+			a, b, d := coalesceResponse(idx, 10), coalesceResponse(idx, 20), coalesceResponse(idx, 30)
+			_, _ = c.Writev([][]byte{a, b})
+			if idx%2 == 0 {
+				_ = c.Flush()
+			}
+			_, _ = c.Write(d)
+		}
+		return None
+	}
+	addr, stop := startCoalesceServer(t, handler)
+	defer stop()
+	conn := dialCoalesce(t, addr)
+	defer conn.Close()
+	const requests = 30
+	for _, r := range [][2]int{{0, 10}, {10, 20}, {20, 30}} { // every callback after the first runs in hold mode
+		if _, err := conn.Write(coalesceRequests(r[0], r[1])); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		for i := r[0]; i < r[1]; i++ {
+			for _, size := range []int{10, 20, 30} {
+				got := make([]byte, size)
+				if _, err := io.ReadFull(conn, got); err != nil {
+					t.Fatalf("request %d part %d: %v", i, size, err)
+				}
+				if !bytes.Equal(got, coalesceResponse(i, size)) {
+					t.Fatalf("request %d part %d: wrong bytes", i, size)
+				}
+			}
+		}
 	}
 }

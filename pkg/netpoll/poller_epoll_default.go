@@ -147,14 +147,20 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 	el := newEventList(InitPollEventsCap)
 	var doChores bool
 
-	// With the yield policy on (the default) the loop polls once more without
-	// blocking after every batch and, if that finds nothing, gives the scheduler a
-	// chance to run goroutines that the callbacks made runnable before it blocks
-	// in the kernel. With it off (Options.NoPollYield, see
-	// pollYield) there is nothing to gain from that detour, so the loop goes
-	// straight back to the blocking wait: one syscall and no scheduler round trip
-	// per idle transition instead of two syscalls and a Gosched.
+	// With the yield policy on the loop polls once more without blocking after
+	// every batch and, if that finds nothing, gives the scheduler a chance to run
+	// goroutines that the callbacks made runnable before it blocks in the kernel.
+	// With it off (Options.NoPollYield, see pollYield) there is nothing to gain from
+	// that detour, so the loop goes straight back to the blocking wait: one syscall
+	// and no scheduler round trip per idle transition instead of two syscalls and a
+	// Gosched. The adaptive policy (the engine's default for sub-reactors) is in
+	// between: it yields while other goroutines have recently handed work to this
+	// loop through its task queues, which is the sign that goroutines may be waiting
+	// for the loop's P, and behaves like the "off" policy for a loop that serves its
+	// traffic inline. yieldLeft counts the batches left in that window.
 	yield := !p.noYield
+	adaptive := p.adaptiveYield()
+	yieldLeft := yieldWindow
 	msec := -1
 	for {
 		n, err := epollWait(p.fd, el.events, msec)
@@ -170,6 +176,13 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 		}
 		if yield {
 			msec = 0
+			if adaptive {
+				if yieldLeft > 0 {
+					yieldLeft--
+				} else {
+					msec = -1
+				}
+			}
 		}
 
 		for i := 0; i < n; i++ {
@@ -192,6 +205,7 @@ func (p *Poller) Polling(callback PollEventHandler) error {
 
 		if doChores {
 			doChores = false
+			yieldLeft = yieldWindow // somebody is feeding this loop from another goroutine
 			task := p.urgentAsyncTaskQueue.Dequeue()
 			for ; task != nil; task = p.urgentAsyncTaskQueue.Dequeue() {
 				err = task.Exec(task.Param)

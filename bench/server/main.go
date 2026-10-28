@@ -39,6 +39,7 @@ var (
 	writeBuf   = flag.Int("wbuf", 0, "WriteBufferCap, 0 = gnet default")
 	bodySize   = flag.Int("body", 12, "http response body size in bytes")
 	noYield    = flag.Bool("noyield", false, "NoPollYield: do not Gosched before blocking in the poller (inline-processing servers)")
+	forceYield = flag.Bool("alwaysyield", false, "AlwaysPollYield: Gosched before every blocking wait, as upstream gnet does (default: adaptive)")
 	lockOS     = flag.Bool("lockthread", false, "LockOSThread for every event-loop")
 	noCoalesce = flag.Bool("nocoalesce", false, "NoWriteCoalescing: every Write is its own write(2), as in upstream gnet")
 	cpuProf    = flag.String("cpuprofile", "", "write a CPU profile to this file; flushed on SIGINT/SIGTERM")
@@ -320,6 +321,9 @@ func main() {
 	}
 	if *noYield {
 		opts = append(opts, gnet.WithNoPollYield(true))
+	}
+	if *forceYield {
+		opts = append(opts, gnet.WithAlwaysPollYield(true))
 	}
 	if *noCoalesce {
 		opts = append(opts, gnet.WithNoWriteCoalescing(true))

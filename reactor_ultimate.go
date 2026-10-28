@@ -49,7 +49,7 @@ func (el *eventloop) orbit() error {
 		defer runtime.UnlockOSThread()
 	}
 
-	el.poller.SetYield(el.pollYield())
+	el.setupAdaptivePollYield()
 	err := el.poller.Polling()
 	if errors.Is(err, errorx.ErrEngineShutdown) {
 		el.getLogger().Debugf("event-loop(%d) is exiting in terms of the demand from user, %v", el.idx, err)
